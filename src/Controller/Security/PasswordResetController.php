@@ -41,7 +41,7 @@ class PasswordResetController extends AbstractController
     public function requestReset(Request $request, MailerInterface $mailer): Response
     {
         if ($this->getUser()) {
-            return $this->redirectToRoute('internal_documents_dashboard');
+            return $this->redirectToRoute('dashboard');
         }
 
         if ($request->isMethod('POST')) {
@@ -95,6 +95,7 @@ class PasswordResetController extends AbstractController
                     $this->addFlash('error', 'An error occurred while sending the password reset email. Please try again later.');
                 } catch (\Exception $e) {
                     $this->addFlash('error', 'An unexpected error occurred while sending the password reset email. Please try again later.');
+                    $this->addFlash('error', $e->getMessage());
                 }
             }
 
@@ -112,7 +113,7 @@ class PasswordResetController extends AbstractController
         UserPasswordHasherInterface $passwordHasher
     ): Response {
         if ($this->getUser()) {
-            return $this->redirectToRoute('internal_documents_dashboard');
+            return $this->redirectToRoute('dashboard');
         }
 
         $session = $request->getSession();
