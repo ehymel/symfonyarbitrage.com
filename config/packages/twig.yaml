@@ -1,5 +1,12 @@
 twig:
+    paths:
+        'assets/images': images
+        'assets/styles': styles
     file_name_pattern: '*.twig'
+    form_themes:
+        - bootstrap_5_layout.html.twig
+    globals:
+        cloudflare_turnstile_site_key: '%env(CLOUDFLARE_TURNSTILE_SITE_KEY)%'
 
 when@test:
     twig:

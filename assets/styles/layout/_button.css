@@ -1,0 +1,24 @@
+/* Custom getbootstrap.com brand purple accents */
+.btn-brand {
+    --bs-btn-color: #fff;
+    /*--bs-btn-bg: #6f42c1;*/
+    /*--bs-btn-border-color: #6f42c1;*/
+    --bs-btn-bg: #446e7f;
+    --bs-btn-border-color: #446e7f;
+    --bs-btn-hover-color: #fff;
+    --bs-btn-hover-bg: #2d4770;
+    --bs-btn-hover-border-color: #4b7b85;
+}
+
+button.enabled, button.notenabled {
+    border: 0;
+    border-radius: 15px;
+}
+
+button.enabled {
+    --bs-btn-bg: #00ff0022;
+}
+
+button.notenabled {
+    --bs-btn-bg: #ff000022;
+}

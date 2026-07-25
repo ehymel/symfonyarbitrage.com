@@ -1,0 +1,63 @@
+{% extends 'base.html.twig' %}
+
+{% block title %}Two-Factor Authentication{% endblock %}
+
+{% block body %}
+    <div class="container">
+        <div class="row">
+            <div class="bg-light mt-4 p-4 col-lg-8">
+                <h1 class="h3 mb-3 font-weight-normal">Two-factor authentication</h1>
+
+                <table class="table">
+                    <tr>
+                        <th class="nowrap">
+                            Text-based
+                            <br />
+                            {% if user.isTextAuthEnabled %}
+                                <button class="btn btn-sm px-3 rounded-pill shadow-sm enabled">Enabled</button>
+                            {% else %}
+                                <button class="btn btn-sm px-3 rounded-pill shadow-sm notenabled">Not Enabled</button>
+                            {% endif %}
+                        </th>
+                        <td>
+                            If you have a cell phone number in your <a href="{{ path('user_edit') }}">account profile</a> then your
+                            authentication code will be sent to your cell phone upon login.
+                        </td>
+                    </tr>
+{#                    <tr>#}
+{#                        <th>#}
+{#                            Authenticator#}
+{#                            <br />#}
+{#                            {% if user.isTotpAuthenticationEnabled %}#}
+{#                                <button class="btn btn-sm px-3 rounded-pill shadow-sm enabled">Enabled</button>#}
+{#                            {% else %}#}
+{#                                <button class="btn btn-sm px-3 rounded-pill shadow-sm notenabled">Not Enabled</button>#}
+{#                            {% endif %}#}
+{#                        </th>#}
+{#                        <td>#}
+{#                            If you prefer to use an authenticator app like#}
+{#                            <a href="https://authy.com/download/">Authy</a> or#}
+{#                            <a href="https://play.google.com/store/apps/details?id=com.google.android.apps.authenticator2&hl=en_US&pli=1">Google Authenticator</a>#}
+{#                            then download the app to your personal device. After the app is installed, enable it by clicking <a href="{{ path('2fa_qr_enable') }}">here</a>.#}
+{#                            (You can also disable this method by clicking <a href="{{ path('2fa_qr_disable') }}">here</a>.)#}
+{#                        </td>#}
+{#                    </tr>#}
+                    <tr>
+                        <th>
+                            Email
+                            <br />
+                            {% if user.isEmailAuthEnabled %}
+                                <button class="btn btn-sm px-3 rounded-pill shadow-sm enabled">Enabled</button>
+                            {% else %}
+                                <button class="btn btn-sm px-3 rounded-pill shadow-sm notenabled">Not Enabled</button>
+                            {% endif %}
+                        </th>
+                        <td>
+                            Otherwise, your email will be used for authentication.
+                        </td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+    </div>
+{% endblock %}

@@ -1,0 +1,77 @@
+{% extends 'base.html.twig' %}
+
+{% block title %}Passkeys{% endblock %}
+
+{% block body %}
+    <div class="container">
+        <div class="row">
+            <div class="bg-light mt-4 p-4 col-xl-6 col-md-10 col-12">
+                <h3 class="h3 mb-3 font-weight-normal">My Registered Passkeys</h3>
+
+                {% if passkeys is empty %}
+                    <p>You do not have any passkeys registered to this account.</p>
+                {% else %}
+                    <table class="table">
+                        {% for passkey in passkeys %}
+                            <tr {{ stimulus_controller('passkey-removal') }}>
+                                <th>
+                                    Passkey {{ passkey.id|slice(0, 8) }}
+                                </th>
+                                <td>
+                                    <strong>Created at:</strong> {{ passkey.createdAt|date("m/d/Y h:i:s a") }}
+                                    <br />
+                                    <strong>Created from IP:</strong> {{ passkey.ipAddress }}
+                                    <br />
+                                    <strong>Transports:</strong> {{ passkey.transports|join(', ')|default('Unknown') }}
+{#                                    <br />#}
+{#                                    <strong>Usage Counter:</strong> {{ passkey.counter }}#}
+                                </td>
+                                <td>
+                                    <form action="{{ path('passkey_delete', {'id': passkey.id}) }}" method="post"
+                                          data-action="submit->passkey-removal#remove">
+                                        <input type="hidden" name="_token" value="{{ csrf_token('delete_passkey_' ~ passkey.id) }}">
+                                        <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </table>
+                {% endif %}
+
+                <div {{ stimulus_controller('passkey-registration') }}>
+                    <form {{ stimulus_target('passkey-registration', 'form') }}
+                        {{ stimulus_action('passkey-registration', 'submit->passkey-registration#sendPasskeyPayload') }}
+                          action="{{ path('webauthn.controller.creation.response.add_device') }}"
+                          method="post"
+                        {{ stimulus_controller('@web-auth/webauthn-stimulus', {
+                            creationOptionsUrl: path('webauthn.controller.creation.request.add_device'),
+                            creationResultField: '#attestation-payload'
+                        }) }}
+                    >
+                        <input
+                            type="hidden"
+                            value="{{ user.email }}"
+                            id="email"
+                            name="email"
+                            autocomplete="email webauthn"
+                        >
+                        <input
+                            type="hidden"
+                            value="{{ user.email }}"
+                            id="displayName"
+                            name="displayName"
+                        >
+
+                        <input type="hidden" id="attestation-payload" name="attestation" {{ stimulus_target('passkey-registration', 'attestation') }}>
+
+                        <button class="btn btn-primary" type="button"
+                            {{ stimulus_action('@web-auth/webauthn-stimulus', 'signup') }}
+                        >
+                            Register a new Passkey
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+{% endblock %}

@@ -1,0 +1,69 @@
+{% extends 'base.html.twig' %}
+
+{% block title %}Two-Factor Authentication{% endblock %}
+
+{% block body %}
+    <div class="container">
+        <div class="row">
+            {{ include('flash_messages.html.twig') }}
+
+            <div class="login-form bg-light mt-4 p-4 col-xl-4 col-md-8 col-12">
+                <h1 class="h3 mb-3 font-weight-normal">Two-factor authentication</h1>
+
+                <p>
+                    A code was sent to your email. Enter that code here.
+                </p>
+
+                <p>
+                    If you prefer to use text messages to your cell phone or use an authenticator app for
+                    two-factor authentication, then change your preferences after you log in by clicking
+                    on your name (top-right corner) then click "Manage 2fa".
+                </p>
+
+                {% if authenticationError %}
+                    <div class="alert alert-danger">{{ authenticationError|trans(authenticationErrorData, 'SchebTwoFactorBundle') }}</div>
+                {% endif %}
+
+                <form class="form" action="{{ checkPathUrl ?? path(checkPathRoute) }}" method="post">
+                    <p class="widget">
+                        <input
+                                id="_auth_code"
+                                type="text"
+                                name="{{ authCodeParameterName }}"
+                                autocomplete="one-time-code"
+                                class="form-control"
+                                autofocus
+                                style="padding: 10px 5px; line-height: 28px; font-size: 24px; text-align: center;"
+                                inputmode="numeric"
+                                pattern="[0-9]*"
+                        />
+                    </p>
+
+                    {% if displayTrustedOption %}
+                        <p class="widget">
+                            <label for="_trusted">
+                                <input id="_trusted" type="checkbox" name="{{ trustedParameterName }}" checked />
+                                I'm on a trusted device. Skip this step for 14 days.
+                            </label>
+                        </p>
+                    {% endif %}
+                    {% if isCsrfProtectionEnabled %}
+                        <input type="hidden" name="{{ csrfParameterName }}" value="{{ csrf_token(csrfTokenId) }}">
+                    {% endif %}
+                    <a class="btn btn-link" href="{{ logoutPath }}">{{ "cancel"|trans({}, 'SchebTwoFactorBundle') }}</a>
+                    <button class="btn btn-primary">{{ "login"|trans({}, 'SchebTwoFactorBundle') }}</button>
+                    <a id="resend-email-link"
+                       class="btn btn-link"
+                       href="{{ path('2fa_email_resend') }}"
+                       data-controller="resend-countdown"
+                       data-resend-countdown-duration-value=30
+                       data-resend-countdown-target="link"
+                       data-resend-countdown-label-value="Resend email"
+                       data-resend-countdown-auto-start-value="true"
+                       data-action="click->resend-countdown#startCountdown"
+                    >Resend email</a>
+                </form>
+            </div>
+        </div>
+    </div>
+{% endblock %}

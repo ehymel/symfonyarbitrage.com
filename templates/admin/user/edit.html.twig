@@ -1,0 +1,20 @@
+{% extends 'base.html.twig' %}
+
+{% block body %}
+    <div class="container">
+        <div class="row">
+            <div class="col-6"
+                {{ stimulus_controller('sweetalert', {
+                    submitAsync: true,
+                    listUrl: app.request.headers.get('referer'),
+                    deleteUrl: ''
+                }) }}
+            >
+                <h1>Edit Account Information</h1>
+                <br>
+
+                {{ include('admin/user/_form.html.twig') }}
+            </div>
+        </div>
+    </div>
+{% endblock %}

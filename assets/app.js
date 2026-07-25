@@ -7,4 +7,16 @@ import './stimulus_bootstrap.js';
  */
 import './styles/app.css';
 
-console.log('This log comes from assets/app.js - welcome to AssetMapper! 🎉');
+import 'bootstrap';
+import 'bootstrap/dist/css/bootstrap.min.css';
+import "bootstrap-icons/font/bootstrap-icons.css";
+
+import './styles/app.css';
+
+import './styles/layout/_body.css';
+import './styles/layout/_button.css';
+import './styles/layout/_footer.css';
+import './styles/layout/_table.css';
+
+import 'sortable-tablesort'
+import 'sortable-tablesort/dist/sortable.min.css'

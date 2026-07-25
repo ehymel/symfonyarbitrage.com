@@ -1,0 +1,14 @@
+{% extends 'base.html.twig' %}
+
+{% block title %}Unauthorized!{% endblock %}
+
+{% block body %}
+    <div class="container">
+        {% include 'flash_messages.html.twig' %}
+
+        <h1>You are not authorized to view this page.</h1>
+        <p>Please contact your administrator.</p>
+        <br />
+        <a href="{{ path('homepage') }}">Return to homepage</a>
+    </div>
+{% endblock %}

@@ -1,0 +1,26 @@
+<div data-turbo="true">
+    <h3>Recent Logins</h3>
+
+    <turbo-frame id="user-logins">
+        <ul>
+            {% for login in logins %}
+                <li>{{ login.loginTime|date("m/d/Y h:i:s a") }} from {{ login.ipAddress }}</li>
+            {% endfor %}
+        </ul>
+        <div class="row">
+            <div class="col bold text-start">
+                {% if logins.hasPreviousPage() %}
+                    <a href="{{ pagerfanta_page_url(logins, logins.previousPage) }}"> << Older</a>
+                {% endif %}
+            </div>
+            <div class="col">
+                <span class="bold ms-2">Page {{ logins.currentPage }} / {{ logins.nbPages }}</span>
+            </div>
+            <div class="col bold text-end">
+                {% if logins.hasNextPage() %}
+                    <a href="{{ pagerfanta_page_url(logins, logins.nextPage) }}"> Newer >></a>
+                {% endif %}
+            </div>
+        </div>
+    </turbo-frame>
+</div>

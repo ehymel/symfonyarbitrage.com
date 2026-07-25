@@ -1,0 +1,15 @@
+{% for label, messages in app.flashes %}
+    {% for message in messages %}
+        <div class="alert alert-{{ label|default('info') }} alert-dismissible fade show shadow-sm border-0 mb-4" role="alert">
+            <div class="d-flex align-items-center gap-2">
+                {% if label == 'success' %}
+                    <i class="bi bi-check-circle-fill text-success fs-5"></i>
+                {% else %}
+                    <i class="bi bi-exclamation-circle-fill text-warning fs-5"></i>
+                {% endif %}
+                <div>{{ message }}</div>
+            </div>
+            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+        </div>
+    {% endfor %}
+{% endfor %}

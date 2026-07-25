@@ -1,0 +1,19 @@
+{% apply inky_to_html|inline_css(source('@styles/email.css')) %}
+    <container>
+        <row class="header">
+            <columns>
+                <img src="{{ email.image('@images/FDP_logo_100.png') }}" alt="FileDrop Pro">
+            </columns>
+        </row>
+        <row class="content">
+            <columns>
+                {% block content %}{% endblock %}
+            </columns>
+        </row>
+        <row class="footer">
+            <columns>
+                &copy; {{ "now"|date("Y") }} FileDrop Pro. All rights reserved.
+            </columns>
+        </row>
+    </container>
+{% endapply %}

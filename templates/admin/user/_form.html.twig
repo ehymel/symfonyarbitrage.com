@@ -1,0 +1,27 @@
+{{ form_start(form) }}
+    {{ form_row(form.firstName) }}
+    {{ form_row(form.lastName) }}
+    {{ form_row(form.credentials) }}
+    {{ form_row(form.email) }}
+    {{ form_row(form.cellNumber) }}
+    {{ form_row(form.isActivated) }}
+    {{ form_row(form.isVisible) }}
+    {{ form_row(form.roles) }}
+    {{ form_row(form.status) }}
+    <hr>
+
+    <button type="submit" class="btn btn-primary" formnovalidate>Update</button>
+    &nbsp;&nbsp;
+    <button type="button" class="btn btn-primary" data-action="sweetalert#cancel">Cancel</button>
+    {% if not _user.isActivated %}
+        &nbsp;&nbsp;&nbsp;&nbsp;
+        <button type="button"
+                class="btn btn-action"
+                data-action="admin--user#sendActivationEmail"
+                data-url="{{ path('admin_user_email_activation', { id: _user.id }) }}"
+        >Send Activation Email</button>
+    {% endif %}
+    {{ form_row(form._token) }}
+{{ form_end(form, {'render_rest': false}) }}
+
+{% include 'admin/user/_logins.html.twig' %}

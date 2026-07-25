@@ -1,0 +1,33 @@
+table {
+  --color: #d0d0f5;
+  border-collapse: collapse;
+  width: auto;
+  text-align: start;
+}
+
+th.nowrap, td.nowrap {
+    white-space: nowrap;
+}
+
+table.table-prices th, table.table-prices td {
+    border: none;
+}
+
+table.table-prices td {
+    border-left: 2px solid #000;
+}
+
+table.table-prices td:last-child {
+    border-right: 2px solid #000;
+}
+
+table.table-prices thead th {
+    text-align: center;
+    text-decoration: underline;
+    font-size: 1.3em;
+}
+
+table.table-prices tbody td {
+    text-align: center;
+    font-size: 1.2em;
+}

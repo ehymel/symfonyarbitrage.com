@@ -1,0 +1,20 @@
+{% extends 'base.html.twig' %}
+{% set currentUrl = path(app.request.attributes.get('_route'),
+    app.request.attributes.get('_route_params')|merge(app.request.query.all|merge({'ajax': true }))) %}
+
+{% block title %}User Admin{% endblock %}
+
+{% block body %}
+    <div {{ stimulus_controller('reload-content', { url: currentUrl }) }}
+         data-action="modal-form:success->reload-content#refreshContent"
+    >
+        <div class="d-flex flex-row">
+            <h1>Users</h1>
+        </div>
+        <div class="row">
+            <div class="col ms-4" data-reload-content-target="content" data-turbo="false">
+                {{ include('admin/user/_list.html.twig') }}
+            </div>
+        </div>
+    </div>
+{% endblock %}

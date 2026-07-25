@@ -1,0 +1,36 @@
+# See the configuration reference at https://symfony.com/bundles/SchebTwoFactorBundle/6.x/configuration.html
+scheb_two_factor:
+    security_tokens:
+        - Symfony\Component\Security\Core\Authentication\Token\UsernamePasswordToken
+        - Symfony\Component\Security\Http\Authenticator\Token\PostAuthenticationToken
+
+    totp:
+        enabled: true
+        issuer: 'Symfony Arbitrage'
+        template: 'security/2fa_qr_form.html.twig'
+
+    email:
+        enabled: true
+        mailer: App\Service\AuthCodeMailer
+        sender_email: info@symfonyarbitrage.com
+        sender_name: 'Symfony Arbitrage'
+        digits: 6
+        template: 'security/2fa_email_form.html.twig'
+
+    two_factor_provider_decider: App\Service\TwoFAProviderDecider
+
+    trusted_device:
+        enabled: true                 # If the trusted device feature should be enabled
+        lifetime: 1209600              # Lifetime of the trusted device token; 604800 = 7 days; 1209600 = 14 days
+        extend_lifetime: true         # Automatically extend lifetime of the trusted cookie on re-login
+        cookie_name: trusted_device    # Name of the trusted device cookie
+        cookie_secure: false           # Set the 'Secure' (HTTPS Only) flag on the trusted device cookie
+        cookie_same_site: "lax"        # The same-site option of the cookie, can be "lax" or "strict"
+        cookie_path: "/"               # Path to use when setting the cookie
+
+two_factor_text:
+    enabled: true
+    auth_code_sender: App\Service\TextSender2FA
+    digits: 6
+    text: 'To login to the Symfony Arbitrage site, use this code: %s'
+    template: 'security/2fa_text_form.html.twig'

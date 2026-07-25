@@ -1,0 +1,106 @@
+{{ include('flash_messages.html.twig') }}
+
+{% set visibleUsers = users|filter(user => user.isVisible) %}
+{% set hiddenUsers = users|filter(user => not user.isVisible) %}
+
+<table class="table table-striped sortable">
+    <thead>
+    <tr>
+        <th>&nbsp;</th>
+        <th>User</th>
+        <th>Name</th>
+        <th>Tenant</th>
+        <th>Email</th>
+        <th># logins</th>
+        <th>Last login</th>
+        <th>Status</th>
+        <th>Access level</th>
+    </tr>
+    </thead>
+    <tbody>
+    {% for user in visibleUsers %}
+        <tr>
+            <td {{ stimulus_controller('modal-form') }}>
+                <button class="btn btn-sm btn-success"
+                        data-action="modal-form#open"
+                        data-form-url="{{ path('admin_user_edit', { 'id': user.id.toString() }) }}"
+                        data-modal-title="Edit user"
+                >
+                    <span class="bi bi-pencil"></span>
+                </button>
+                {{ include('_modal.html.twig', { modalTitle: 'Edit user' }) }}
+            </td>
+            <td>
+                {{ user.userIdentifier }}
+                {% if is_granted('ROLE_SUPERUSER') and app.user !== user %}
+                    <a href="{{ path('homepage') }}?_switch_user={{ user.userIdentifier }}"><span class="bi bi-person-bounding-box"></span></a>
+                {% endif %}
+            </td>
+            <td>{{ user.name }}</td>
+            <td>{{ user.tenant?.firmName }}</td>
+            <td>{{ user.email }}</td>
+            <td>{{ user.logins|length }}</td>
+            <td>{{ user.status }}</td>
+            <td data-sort="{{ user.lastLogin ? user.lastLogin.loginTime|date("Y-m-d") : '' }}">
+                {{ user.lastLogin ? user.lastLogin.loginTime|date("n/j/Y") : '' }}
+            </td>
+            <td>{{ user.roles|first }}</td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+
+{% if hiddenUsers|length > 0 %}
+<div data-controller="toggle-visibility">
+    <label class="mt-1">
+        Show Hidden Users?
+        <input type="checkbox" class="js-toggle-visibility-documents"
+               data-action="change->toggle-visibility#toggle" />
+    </label>
+
+    <table class="table table-striped sortable d-none" data-toggle-visibility-target="element">
+        <thead>
+        <tr>
+            <th>&nbsp;</th>
+            <th>User</th>
+            <th>Name</th>
+            <th>Tenant</th>
+            <th>Email</th>
+            <th># logins</th>
+            <th>Last login</th>
+            <th>Access level</th>
+        </tr>
+        </thead>
+        <tbody>
+        {% for user in hiddenUsers %}
+            <tr>
+                <td {{ stimulus_controller('modal-form') }}>
+                    <button class="btn btn-sm btn-success"
+                            data-action="modal-form#open"
+                            data-form-url="{{ path('admin_user_edit', { 'id': user.id.toString() }) }}"
+                            data-modal-title="Edit user"
+                    >
+                        <span class="bi bi-pencil"></span>
+                    </button>
+                    {{ include('_modal.html.twig', { modalTitle: 'Edit user' }) }}
+                </td>
+                <td>
+                    {{ user.userIdentifier }}
+                    {% if is_granted('ROLE_SUPERUSER') and app.user !== user %}
+                        <a href="{{ path('homepage') }}?_switch_user={{ user.userIdentifier }}"><span class="bi bi-person-bounding-box"></span></a>
+                    {% endif %}
+                </td>
+                <td>{{ user.name }}</td>
+                <td>{{ user.tenant?.firmName }}</td>
+                <td>{{ user.email }}</td>
+                <td>{{ user.logins|length }}</td>
+                <td data-sort="{{ user.lastLogin ? user.lastLogin.loginTime|date("Y-m-d") : '' }}">
+                    {{ user.lastLogin ? user.lastLogin.loginTime|date("n/j/Y") : '' }}
+                </td>
+                <td>{{ user.roles|first }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}

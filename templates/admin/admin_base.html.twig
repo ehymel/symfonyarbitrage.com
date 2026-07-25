@@ -1,0 +1,17 @@
+{% extends 'base.html.twig' %}
+
+{% block body %}
+    <div class="container">
+        <div class="row">
+            <div class="col-6">
+                <h1>Admin</h1>
+
+                <hr>
+
+                {% if is_granted('ROLE_ADMIN') %}
+
+                {% endif %}
+            </div>
+        </div>
+    </div>
+{% endblock %}
