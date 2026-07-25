@@ -10,7 +10,7 @@ use Doctrine\ORM\Mapping as ORM;
 class TradeExecution
 {
     #[ORM\Id, ORM\Column(type: Types::BIGINT), ORM\GeneratedValue]
-    public ?int $id = null;
+    private(set) ?int $id = null;
 
     #[ORM\ManyToOne(targetEntity: ArbitrageOpportunity::class)]
     #[ORM\JoinColumn(nullable: false)]

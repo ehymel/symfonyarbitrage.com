@@ -10,7 +10,7 @@ use Doctrine\ORM\Mapping as ORM;
 class ArbitrageOpportunity
 {
     #[ORM\Id, ORM\Column(type: Types::BIGINT), ORM\GeneratedValue]
-    public ?int $id = null;
+    private(set) ?int $id = null;
 
     #[ORM\Column(length: 20)]
     public ?string $pair = null;

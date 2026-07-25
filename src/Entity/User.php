@@ -16,7 +16,6 @@ use Stringable;
 use Symfony\Bridge\Doctrine\Validator\Constraints\UniqueEntity;
 use Symfony\Component\Security\Core\User\PasswordAuthenticatedUserInterface;
 use Symfony\Component\Security\Core\User\UserInterface;
-use Symfony\Component\Uid\Uuid;
 use Symfony\Component\Validator\Constraints as Assert;
 
 #[ORM\Entity(repositoryClass: UserRepository::class)]
@@ -29,11 +28,8 @@ class User implements UserInterface, PasswordAuthenticatedUserInterface, TotpTwo
         $this->logins = new ArrayCollection();
     }
 
-    #[ORM\Id]
-    #[ORM\Column(type: 'uuid', unique: true)]
-    #[ORM\GeneratedValue(strategy: 'CUSTOM')]
-    #[ORM\CustomIdGenerator(class: 'doctrine.uuid_generator')]
-    public ?Uuid $id = null;
+    #[ORM\Id, ORM\GeneratedValue, ORM\Column]
+    private(set) ?int $id = null;
 
     #[ORM\Column]
     #[Assert\NotBlank, Assert\Email]
