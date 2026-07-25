@@ -4,12 +4,30 @@ import { Controller } from '@hotwired/stimulus';
 export default class extends Controller {
     static targets = ['widget', 'submit']
     static values = {
-        sitekey: String
+        sitekey: String,
+        // Spin telemetry marker. With explicit rendering Turnstile reads the
+        // action from the render options, not from a data-action attribute
+        // (which Stimulus would also try to parse as an action descriptor).
+        action: { type: String, default: 'turnstile-spin-v2' }
     }
 
     connect() {
         this.disableSubmit();
         this.render();
+    }
+
+    disconnect() {
+        // Turbo swaps the page without a reload; drop the widget so a stale
+        // one is not left behind holding an expired token.
+        if (this.checkInterval) {
+            clearInterval(this.checkInterval);
+        }
+
+        if (this.widgetId && typeof window.turnstile !== 'undefined') {
+            window.turnstile.remove(this.widgetId);
+        }
+
+        this.widgetId = null;
     }
 
     render() {
@@ -19,6 +37,7 @@ export default class extends Controller {
             if (!this.widgetId) {
                 this.widgetId = window.turnstile.render(widgetElement, {
                     sitekey: this.sitekeyValue,
+                    action: this.actionValue,
                     callback: () => this.enableSubmit(),
                     'expired-callback': () => this.disableSubmit(),
                     'error-callback': () => this.disableSubmit(),

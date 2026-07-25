@@ -3,6 +3,8 @@
 namespace App\Controller\Security;
 
 use App\Entity\User;
+use App\Security\TurnstileAuthenticationSubscriber;
+use App\Security\TurnstileVerifier;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bridge\Twig\Mime\TemplatedEmail;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
@@ -20,7 +22,20 @@ use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
 #[Route('/user/password', name: 'user_password_', methods: ['GET', 'POST'])]
 class PasswordResetController extends AbstractController
 {
-    public function __construct(private EntityManagerInterface $em) {}
+    public function __construct(
+        private EntityManagerInterface $em,
+        private readonly TurnstileVerifier $turnstileVerifier,
+    ) {}
+
+    /**
+     * Validates the Cloudflare Turnstile token attached to a submitted form.
+     */
+    private function isTurnstileValid(Request $request): bool
+    {
+        $token = (string) $request->request->get(TurnstileAuthenticationSubscriber::TOKEN_PARAMETER, '');
+
+        return $this->turnstileVerifier->verify($token, $request->getClientIp());
+    }
 
     #[Route('/password/forgot/', name: 'forgot', methods: ['GET', 'POST'])]
     public function requestReset(Request $request, MailerInterface $mailer): Response
@@ -33,6 +48,11 @@ class PasswordResetController extends AbstractController
             $submittedToken = $request->request->get('_token');
             if (!$this->isCsrfTokenValid('forgot_password_request', $submittedToken)) {
                 $this->addFlash('danger', 'Invalid security token.');
+                return $this->redirectToRoute('user_password_forgot');
+            }
+
+            if (!$this->isTurnstileValid($request)) {
+                $this->addFlash('danger', 'Bot verification failed. Please complete the challenge and try again.');
                 return $this->redirectToRoute('user_password_forgot');
             }
 
@@ -114,6 +134,11 @@ class PasswordResetController extends AbstractController
             $submittedToken = $request->request->get('_token');
             if (!$this->isCsrfTokenValid('reset_forgotten_password_token', $submittedToken)) {
                 $this->addFlash('danger', 'Invalid security token.');
+                return $this->redirectToRoute('user_password_reset', ['token' => $token]);
+            }
+
+            if (!$this->isTurnstileValid($request)) {
+                $this->addFlash('danger', 'Bot verification failed. Please complete the challenge and try again.');
                 return $this->redirectToRoute('user_password_reset', ['token' => $token]);
             }
 

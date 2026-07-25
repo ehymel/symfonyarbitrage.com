@@ -61,6 +61,7 @@
                     <div data-login-target="stepPassword" class="d-none"
                          data-controller="turnstile"
                          data-turnstile-sitekey-value="{{ cloudflare_turnstile_site_key }}"
+                         data-turnstile-action-value="turnstile-spin-v2"
                     >
                         <p class="ms-2 mb-3 larger">
                             Enter the password for
@@ -80,6 +81,7 @@
 
                         <div class="mb-3">
                             <div id="turnstile-widget"
+                                 class="cf-turnstile"
                                  data-turnstile-target="widget"></div>
                         </div>
 

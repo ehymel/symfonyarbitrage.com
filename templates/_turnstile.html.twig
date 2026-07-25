@@ -1,0 +1,23 @@
+{#
+    Cloudflare Turnstile widget (implicit render).
+
+    Turnstile scans for `.cf-turnstile` on load and injects a hidden
+    `cf-turnstile-response` input into the enclosing <form>, which the
+    server-side siteverify call then validates.
+
+    Requires api.js on the page:
+        {% block javascripts %}
+            {{ parent() }}
+            {{ include('_turnstile_script.html.twig') }}
+        {% endblock %}
+
+    `data-action` is the Spin telemetry marker for account-level attribution.
+    Keep it on every widget.
+
+    Params:
+        size  - normal (default) | flexible | compact
+#}
+<div class="cf-turnstile"
+     data-sitekey="{{ cloudflare_turnstile_site_key }}"
+     data-action="turnstile-spin-v2"
+     data-size="{{ size|default('normal') }}"></div>
