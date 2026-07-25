@@ -2,11 +2,11 @@
 
 namespace App\Entity;
 
+use App\Repository\TradeExecutionRepository;
 use Doctrine\DBAL\Types\Types;
 use Doctrine\ORM\Mapping as ORM;
-use Doctrine\ORM\Mapping\JoinColumn;
 
-#[ORM\Entity]
+#[ORM\Entity(repositoryClass: TradeExecutionRepository::class)]
 class TradeExecution
 {
     #[ORM\Id, ORM\Column(type: Types::BIGINT), ORM\GeneratedValue]

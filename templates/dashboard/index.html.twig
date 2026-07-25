@@ -1,3 +1,101 @@
 {% extends 'base.html.twig' %}
 
-{% block title %}Dashboard - Symfony Arbitrage{% endblock %}
+{% block title %}Arbitrage Monitoring Dashboard{% endblock %}
+
+{% block body %}
+    <div class="container-fluid py-4"
+         data-controller="execution-monitor"
+         data-execution-monitor-url-value="{{ path('api_executions_recent') }}"
+         data-execution-monitor-refresh-interval-value="3000">
+
+        <!-- Header Section -->
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <div>
+                <h1 class="h3 mb-0 text-gray-800">Arbitrage Execution Engine</h1>
+                <p class="text-muted small mb-0">Real-time trade auditing and execution metrics</p>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+                <span class="spinner-grow spinner-grow-sm text-success" role="status" data-execution-monitor-target="spinner"></span>
+                <span class="badge bg-success" data-execution-monitor-target="liveStatus">Live Polling Active</span>
+                <button class="btn btn-outline-secondary btn-sm ms-2" data-action="click->execution-monitor#fetchData">
+                    <i class="bi bi-arrow-clockwise"></i> Refresh Now
+                </button>
+            </div>
+        </div>
+
+        <!-- Summary Metrics Cards -->
+        <div class="row g-3 mb-4">
+            <div class="col-12 col-md-4">
+                <div class="card border-0 shadow-sm border-start border-4 border-primary">
+                    <div class="card-body">
+                        <div class="text-uppercase text-muted fw-bold extra-small">24h Realized Profit</div>
+                        <div class="h3 mb-0 fw-bold text-success" data-execution-monitor-target="totalProfit">$0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-12 col-md-4">
+                <div class="card border-0 shadow-sm border-start border-4 border-info">
+                    <div class="card-body">
+                        <div class="text-uppercase text-muted fw-bold extra-small">Success Rate</div>
+                        <div class="h3 mb-0 fw-bold text-dark" data-execution-monitor-target="successRate">0%</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-12 col-md-4">
+                <div class="card border-0 shadow-sm border-start border-4 border-warning">
+                    <div class="card-body">
+                        <div class="text-uppercase text-muted fw-bold extra-small">Total Executions Evaluated</div>
+                        <div class="h3 mb-0 fw-bold text-dark" data-execution-monitor-target="totalCount">0</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Executions Table -->
+        <div class="card border-0 shadow-sm">
+            <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center">
+                <h6 class="m-0 font-weight-bold text-primary">Recent Trade Executions</h6>
+                <small class="text-muted">Auto-refreshes every 3s</small>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead class="table-light">
+                        <tr>
+                            <th>Time</th>
+                            <th>Pair</th>
+                            <th>Route (Buy ➔ Sell)</th>
+                            <th>Target Prices</th>
+                            <th>Filled Prices</th>
+                            <th>Net Profit</th>
+                            <th>Latency</th>
+                            <th>Status</th>
+                            <th class="text-end">Details</th>
+                        </tr>
+                        </thead>
+                        <tbody data-execution-monitor-target="tableBody">
+                        <tr>
+                            <td colspan="9" class="text-center py-4 text-muted">Loading trade execution logs...</td>
+                        </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Bootstrap Modal for Trade Inspection -->
+        <div class="modal fade" id="executionDetailModal" tabindex="-1" aria-hidden="true" data-execution-monitor-target="modal">
+            <div class="modal-dialog modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Execution Detail Audit</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        <pre class="bg-light p-3 rounded text-monospace small mb-0" data-execution-monitor-target="modalContent">Select an execution to inspect...</pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+{% endblock %}

@@ -2,10 +2,11 @@
 
 namespace App\Entity;
 
+use App\Repository\ArbitrageOpportunityRepository;
 use Doctrine\DBAL\Types\Types;
 use Doctrine\ORM\Mapping as ORM;
 
-#[ORM\Entity]
+#[ORM\Entity(repositoryClass: ArbitrageOpportunityRepository::class)]
 class ArbitrageOpportunity
 {
     #[ORM\Id, ORM\Column(type: Types::BIGINT), ORM\GeneratedValue]
