@@ -2,7 +2,7 @@
 
 namespace App\Command;
 
-use App\Service\ExchangeService\CoinbaseExchangeService;
+use App\Service\ExchangeService\KrakenExchangeService;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -10,12 +10,12 @@ use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Style\SymfonyStyle;
 
 #[AsCommand(
-    name: 'app:test:coinbase',
-    description: 'Test Coinbase connection.'
+    name: 'app:test:kraken',
+    description: 'Test Kraken connection.'
 )]
-class TestCoinbaseConnectionCommand extends Command
+class TestKrakenConnectionCommand extends Command
 {
-    public function __construct(private readonly CoinbaseExchangeService $exchange)
+    public function __construct(private readonly KrakenExchangeService $exchange)
     {
         parent::__construct();
     }
@@ -23,7 +23,7 @@ class TestCoinbaseConnectionCommand extends Command
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $io = new SymfonyStyle($input, $output);
-        $io->title('Test Coinbase Connection');
+        $io->title('Test Kraken Connection');
 
         // 1. Test View Permission
         $balance = $this->exchange->getBalance();
