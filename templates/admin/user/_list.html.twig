@@ -9,11 +9,9 @@
         <th>&nbsp;</th>
         <th>User</th>
         <th>Name</th>
-        <th>Tenant</th>
         <th>Email</th>
         <th># logins</th>
         <th>Last login</th>
-        <th>Status</th>
         <th>Access level</th>
     </tr>
     </thead>
@@ -37,10 +35,8 @@
                 {% endif %}
             </td>
             <td>{{ user.name }}</td>
-            <td>{{ user.tenant?.firmName }}</td>
             <td>{{ user.email }}</td>
             <td>{{ user.logins|length }}</td>
-            <td>{{ user.status }}</td>
             <td data-sort="{{ user.lastLogin ? user.lastLogin.loginTime|date("Y-m-d") : '' }}">
                 {{ user.lastLogin ? user.lastLogin.loginTime|date("n/j/Y") : '' }}
             </td>
@@ -64,7 +60,6 @@
             <th>&nbsp;</th>
             <th>User</th>
             <th>Name</th>
-            <th>Tenant</th>
             <th>Email</th>
             <th># logins</th>
             <th>Last login</th>
@@ -91,7 +86,6 @@
                     {% endif %}
                 </td>
                 <td>{{ user.name }}</td>
-                <td>{{ user.tenant?.firmName }}</td>
                 <td>{{ user.email }}</td>
                 <td>{{ user.logins|length }}</td>
                 <td data-sort="{{ user.lastLogin ? user.lastLogin.loginTime|date("Y-m-d") : '' }}">

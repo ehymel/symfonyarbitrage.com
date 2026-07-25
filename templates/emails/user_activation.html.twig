@@ -1,0 +1,25 @@
+{% extends 'emails/email_base.html.twig' %}
+
+{% block content %}
+    <h2>Activate Your Account</h2>
+
+    <p>Dear {{ user.name }},</p>
+
+    <p>An account has been created for you on the FileDrop Pro website.</p>
+
+    <p>Please make a note of your email: <strong>{{ user.email }}</strong></p>
+
+    <p>You must activate your account using the link below before your first login. Once your account is activated, you will be asked to create a password.</p>
+
+    <center>
+        <button href="{{ url('user_activate', {'id': user.id, 'hash': hash}) }}" class="button">Activate My Account</button>
+    </center>
+
+    <p class="secondary-text">
+        If you cannot click the button above, copy and paste this link into your browser:<br>
+        {{ url('user_activate', {'id': user.id, 'hash': hash}) }}
+    </p>
+
+    <h3>Having trouble logging in?</h3>
+    <p>You can try: <a href="{{ url('security_login') }}">Request password change email</a></p>
+{% endblock %}

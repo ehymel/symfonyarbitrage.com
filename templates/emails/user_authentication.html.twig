@@ -1,0 +1,9 @@
+{% extends 'emails/email_base.html.twig' %}
+
+{% block content %}
+    <h2>Authentication Code</h2>
+
+    <p>Here is your login authentication code:</p>
+    <h1 style="text-align: center; letter-spacing: 5px; color: #4f46e5;">{{ authCode }}</h1>
+    <p class="secondary-text">If you did not request this code, you can safely ignore this email.</p>
+{% endblock %}

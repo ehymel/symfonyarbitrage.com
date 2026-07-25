@@ -3,7 +3,6 @@
 namespace App\Controller\Security;
 
 use App\Entity\User;
-use App\Security\TurnstileAuthenticationSubscriber;
 use App\Security\TurnstileVerifier;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bridge\Twig\Mime\TemplatedEmail;
@@ -25,20 +24,11 @@ class PasswordResetController extends AbstractController
     public function __construct(
         private EntityManagerInterface $em,
         private readonly TurnstileVerifier $turnstileVerifier,
+        private readonly MailerInterface $mailer
     ) {}
 
-    /**
-     * Validates the Cloudflare Turnstile token attached to a submitted form.
-     */
-    private function isTurnstileValid(Request $request): bool
-    {
-        $token = (string) $request->request->get(TurnstileAuthenticationSubscriber::TOKEN_PARAMETER, '');
-
-        return $this->turnstileVerifier->verify($token, $request->getClientIp());
-    }
-
     #[Route('/password/forgot/', name: 'forgot', methods: ['GET', 'POST'])]
-    public function requestReset(Request $request, MailerInterface $mailer): Response
+    public function requestReset(Request $request): Response
     {
         if ($this->getUser()) {
             return $this->redirectToRoute('dashboard');
@@ -51,8 +41,11 @@ class PasswordResetController extends AbstractController
                 return $this->redirectToRoute('user_password_forgot');
             }
 
-            if (!$this->isTurnstileValid($request)) {
-                $this->addFlash('danger', 'Bot verification failed. Please complete the challenge and try again.');
+            if (!$this->turnstileVerifier->verify(
+                $request->request->get('cf-turnstile-response'),
+                $request->getClientIp()
+            )) {
+                $this->addFlash('danger', 'Security verification failed. Please complete the challenge and try again.');
                 return $this->redirectToRoute('user_password_forgot');
             }
 
@@ -90,7 +83,7 @@ class PasswordResetController extends AbstractController
                     ]);
 
                 try {
-                    $mailer->send($email);
+                    $this->mailer->send($email);
                 } catch (TransportExceptionInterface $e) {
                     $this->addFlash('error', 'An error occurred while sending the password reset email. Please try again later.');
                 } catch (\Exception $e) {
@@ -138,17 +131,18 @@ class PasswordResetController extends AbstractController
                 return $this->redirectToRoute('user_password_reset', ['token' => $token]);
             }
 
-            if (!$this->isTurnstileValid($request)) {
-                $this->addFlash('danger', 'Bot verification failed. Please complete the challenge and try again.');
-                return $this->redirectToRoute('user_password_reset', ['token' => $token]);
+            if (!$this->turnstileVerifier->verify(
+                $request->request->get('cf-turnstile-response'),
+                $request->getClientIp()
+            )) {
+                $this->addFlash('danger', 'Security verification failed. Please complete the challenge and try again.');
+                return $this->redirectToRoute('user_password_forgot');
             }
 
             $newPassword = $request->request->get('new_password');
-            $newPublicKey = $request->request->get('new_public_key');
-            $newEncPrivateKeyPayload = $request->request->get('new_encrypted_private_key');
 
-            if (empty($newPassword) || empty($newPublicKey) || empty($newEncPrivateKeyPayload)) {
-                $this->addFlash('danger', 'Cryptographic identity parameters are missing. Refusing server-side authentication update.');
+            if (empty($newPassword)) {
+                $this->addFlash('danger', 'New password missing. Refusing server-side authentication update.');
                 return $this->redirectToRoute('user_password_reset', ['token' => $token]);
             }
 

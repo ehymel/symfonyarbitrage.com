@@ -17,4 +17,5 @@ return [
     Erkens\Security\TwoFactorTextBundle\TwoFactorTextBundle::class => ['all' => true],
     Stof\DoctrineExtensionsBundle\StofDoctrineExtensionsBundle::class => ['all' => true],
     Webauthn\Bundle\WebauthnBundle::class => ['all' => true],
+    BabDev\PagerfantaBundle\BabDevPagerfantaBundle::class => ['all' => true],
 ];
