@@ -1,0 +1,188 @@
+<?php
+
+namespace App\MessageHandler;
+
+use App\Entity\ArbitrageOpportunity;
+use App\Entity\TradeExecution;
+use App\Message\ExecuteArbitrageMessage;
+use App\Service\ExchangeFactory;
+use App\Service\TradingCircuitBreaker;
+use Doctrine\ORM\EntityManagerInterface;
+use Doctrine\ORM\Exception\ORMException;
+use GuzzleHttp\Promise\Promise;
+use GuzzleHttp\Promise\Utils;
+use Psr\Cache\InvalidArgumentException;
+use Psr\Log\LoggerInterface;
+use Symfony\Component\Messenger\Attribute\AsMessageHandler;
+
+#[AsMessageHandler]
+class ExecuteArbitrageHandler
+{
+    public function __construct(
+        private readonly ExchangeFactory $exchangeFactory,
+        private readonly TradingCircuitBreaker $circuitBreaker,
+        private readonly EntityManagerInterface $em,
+        private readonly LoggerInterface $logger
+    ) {}
+
+    /**
+     * @throws InvalidArgumentException
+     * @throws ORMException
+     */
+    public function __invoke(ExecuteArbitrageMessage $message): void
+    {
+        $buyExchangeName = $message->getBuyExchange();
+        $sellExchangeName = $message->getSellExchange();
+
+        // 1. PRE-FLIGHT CHECK: Circuit Breaker Check
+        if (!$this->circuitBreaker->isAllowed($buyExchangeName) || !$this->circuitBreaker->isAllowed($sellExchangeName)) {
+            $this->logger->warning("Execution aborted by Circuit Breaker for opportunity {$message->getOpportunityId()}");
+            return;
+        }
+
+        $buyExchange = $this->exchangeFactory->create($buyExchangeName);
+        $sellExchange = $this->exchangeFactory->create($sellExchangeName);
+
+        // 2. PREPARE PARALLEL PROMISES
+        // We wrap synchronous CCXT execution into Guzzle async promises
+        // to force cURL multi-exec to send HTTP POST requests concurrently over the wire.
+        $startTime = microtime(true);
+
+        $buyPromise = new Promise(function () use (&$buyPromise, $buyExchange, $message) {
+            try {
+                // Execute Market BUY on Exchange A
+                $order = $buyExchange->create_order(
+                    $message->getSymbol(),
+                    'market',
+                    'buy',
+                    $message->getAmount()
+                );
+                $buyPromise->resolve($order);
+            } catch (\Throwable $e) {
+                $buyPromise->reject($e);
+            }
+        });
+
+        $sellPromise = new Promise(function () use (&$sellPromise, $sellExchange, $message) {
+            try {
+                // Execute Market SELL on Exchange B
+                $order = $sellExchange->create_order(
+                    $message->getSymbol(),
+                    'market',
+                    'sell',
+                    $message->getAmount()
+                );
+                $sellPromise->resolve($order);
+            } catch (\Throwable $e) {
+                $sellPromise->reject($e);
+            }
+        });
+
+        // 3. EXECUTE SIMULTANEOUSLY OVER NETWORK
+        $promises = [
+            'buy' => $buyPromise,
+            'sell' => $sellPromise,
+        ];
+
+        $results = [];
+        $errors = [];
+
+        // Settlement pool: Wait for both HTTP calls to complete or fail
+        $settled = Utils::settle($promises)->wait();
+
+        foreach ($settled as $key => $result) {
+            if ($result['state'] === 'fulfilled') {
+                $results[$key] = $result['value'];
+            } else {
+                $errors[$key] = $result['reason'];
+            }
+        }
+
+        $executionTimeMs = (int) ((microtime(true) - $startTime) * 1000);
+
+        // 4. HANDLE EXECUTION OUTCOMES & RISK UNWINDING
+        if (count($results) === 2) {
+            // SUCCESS: Both orders executed simultaneously
+            $this->circuitBreaker->recordSuccess($buyExchangeName, $executionTimeMs);
+            $this->circuitBreaker->recordSuccess($sellExchangeName, $executionTimeMs);
+
+            $this->logExecutionToRds($message, $results['buy'], $results['sell'], 'COMPLETED', $executionTimeMs);
+
+        } elseif (isset($results['buy']) && isset($errors['sell'])) {
+            // CRITICAL RISK: Partial Fill! BUY filled, but SELL failed.
+            $this->circuitBreaker->recordFailure($sellExchangeName, "SELL order failed: " . $errors['sell']->getMessage());
+
+            $this->logger->critical("PARTIAL FILL DETECTED! Unwinding position on {$buyExchangeName}...");
+            $this->unwindPosition($buyExchange, $message->getSymbol(), 'sell', $message->getAmount());
+
+            $this->logExecutionToRds($message, $results['buy'], null, 'PARTIAL_BUY_UNWOUND', $executionTimeMs);
+
+        } elseif (isset($results['sell']) && isset($errors['buy'])) {
+            // CRITICAL RISK: Partial Fill! SELL filled, but BUY failed.
+            $this->circuitBreaker->recordFailure($buyExchangeName, "BUY order failed: " . $errors['buy']->getMessage());
+
+            $this->logger->critical("PARTIAL FILL DETECTED! Unwinding position on {$sellExchangeName}...");
+            $this->unwindPosition($sellExchange, $message->getSymbol(), 'buy', $message->getAmount());
+
+            $this->logExecutionToRds($message, null, $results['sell'], 'PARTIAL_SELL_UNWOUND', $executionTimeMs);
+
+        } else {
+            // TOTAL FAILURE: Both orders failed
+            $this->circuitBreaker->recordFailure($buyExchangeName, $errors['buy']->getMessage());
+            $this->circuitBreaker->recordFailure($sellExchangeName, $errors['sell']->getMessage());
+
+            $this->logExecutionToRds($message, null, null, 'FAILED', $executionTimeMs);
+        }
+    }
+
+    /**
+     * Emergency Unwind: Immediately market-reverses an orphaned trade to flatten position.
+     */
+    private function unwindPosition($exchange, string $symbol, string $side, float $amount): void
+    {
+        try {
+            $exchange->create_order($symbol, 'market', $side, $amount);
+            $this->logger->info("Position successfully unwound via market {$side}.");
+        } catch (\Throwable $e) {
+            $this->logger->emergency("CRITICAL FAILURE: Emergency unwind failed! Manual intervention required! Error: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Records transactional execution details into RDS.
+     * @throws ORMException
+     */
+    private function logExecutionToRds(
+        ExecuteArbitrageMessage $msg,
+        ?array $buyResult,
+        ?array $sellResult,
+        string $status,
+        int $latencyMs
+    ): void {
+        // 1. Fetch reference to parent opportunity
+        $opportunity = $this->em->getReference(ArbitrageOpportunity::class, $msg->getOpportunityId());
+
+        // 2. Calculate actual realized profit if both filled
+        $actualProfitUsd = null;
+        if ($buyResult && $sellResult) {
+            $buyFilled = (float) ($buyResult['price'] ?? $buyResult['average'] ?? $msg->getBuyPrice());
+            $sellFilled = (float) ($sellResult['price'] ?? $sellResult['average'] ?? $msg->getSellPrice());
+            $actualProfitUsd = number_format(($sellFilled - $buyFilled) * $msg->getAmount(), 4, '.', '');
+        }
+
+        // 3. Populate TradeExecution matching RDS schema
+        $execution = new TradeExecution();
+        $execution->opportunity = $opportunity;
+        $execution->buyOrderId = $buyResult['id'] ?? null;
+        $execution->sellOrderId = $sellResult['id'] ?? null;
+        $execution->buyFilledPrice = (isset($buyResult['price']) ? (string)$buyResult['price'] : null);
+        $execution->sellFilledPrice = (isset($sellResult['price']) ? (string)$sellResult['price'] : null);
+        $execution->actualProfitUSD = $actualProfitUsd;
+        $execution->status = $status;
+        $execution->executionTimeMs = $latencyMs;
+        $execution->createdAt = new \DateTimeImmutable("now");
+
+        $this->em->persist($execution);
+        $this->em->flush();
+    }
+}

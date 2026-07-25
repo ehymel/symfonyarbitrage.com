@@ -6,13 +6,16 @@ use Doctrine\DBAL\Types\Types;
 use Doctrine\ORM\Mapping as ORM;
 
 #[ORM\Entity]
-class AribitrageOpportunity
+class ArbitrageOpportunity
 {
     #[ORM\Id, ORM\Column(type: Types::BIGINT), ORM\GeneratedValue]
     public ?int $id = null;
 
     #[ORM\Column(length: 20)]
     public ?string $pair = null;
+
+    #[ORM\Column(length: 50)]
+    public ?string $symbol = null;
 
     #[ORM\Column(length: 50)]
     public ?string $buyExchange = null;

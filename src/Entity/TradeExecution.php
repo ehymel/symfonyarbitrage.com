@@ -4,6 +4,7 @@ namespace App\Entity;
 
 use Doctrine\DBAL\Types\Types;
 use Doctrine\ORM\Mapping as ORM;
+use Doctrine\ORM\Mapping\JoinColumn;
 
 #[ORM\Entity]
 class TradeExecution
@@ -11,8 +12,9 @@ class TradeExecution
     #[ORM\Id, ORM\Column(type: Types::BIGINT), ORM\GeneratedValue]
     public ?int $id = null;
 
-    #[ORM\ManyToOne(targetEntity: AribitrageOpportunity::class)]
-    public ?AribitrageOpportunity $opportunity = null;
+    #[ORM\ManyToOne(targetEntity: ArbitrageOpportunity::class)]
+    #[ORM\JoinColumn(nullable: false)]
+    public ?ArbitrageOpportunity $opportunity = null;
 
     #[ORM\Column(length: 100)]
     public ?string $buyOrderId = null;
@@ -29,11 +31,11 @@ class TradeExecution
     #[ORM\Column(type: Types::DECIMAL, precision: 10, scale: 4)]
     public ?string $actualProfitUSD = null;
 
-    #[ORM\Column(length: 20)]
-    public ?string $status = null;  // PENDING, COMPLETED, PARTIAL_FILL, FAILED
+    #[ORM\Column(length: 30)]
+    public ?string $status = null;  // COMPLETED, PARTIAL_BUY_UNWOUND, PARTIAL_SELL_UNWOUND, FAILED
 
     #[ORM\Column]
-    public ?int $executionTime_ms;
+    public ?int $executionTimeMs;
 
     #[ORM\Column]
     public ?\DateTimeImmutable $createdAt = null;
