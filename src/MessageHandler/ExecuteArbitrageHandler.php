@@ -8,6 +8,7 @@ use App\Message\ExecuteArbitrageMessage;
 use App\Service\ExchangeFactory;
 use App\Service\ExchangeService\ExchangeServiceInterface;
 use App\Service\FundingVerdict;
+use App\Service\MinimumOrderSizeGuard;
 use App\Service\TradeFundingGuard;
 use App\Service\TradingCircuitBreaker;
 use Doctrine\ORM\EntityManagerInterface;
@@ -30,6 +31,7 @@ readonly class ExecuteArbitrageHandler
     public function __construct(
         private ExchangeFactory        $exchangeFactory,
         private TradingCircuitBreaker  $circuitBreaker,
+        private MinimumOrderSizeGuard  $orderSizeGuard,
         private TradeFundingGuard      $fundingGuard,
         private EntityManagerInterface $em,
         private LoggerInterface        $logger,
@@ -58,7 +60,38 @@ readonly class ExecuteArbitrageHandler
         $buyExchange = $this->exchangeFactory->create($buyExchangeName);
         $sellExchange = $this->exchangeFactory->create($sellExchangeName);
 
-        // 2. PRE-FLIGHT CHECK: Funding on both venues
+        // 2. PRE-FLIGHT CHECK: Venue minimum order size
+        // Ahead of the funding read because it costs nothing — the floors are static market
+        // metadata already in memory from the warm-up — and there is no sense spending a
+        // balance round trip on an order too small to place. A venue enforces its minimum
+        // the same way it enforces anything else: by rejecting the order, with the other
+        // leg already filled.
+        //
+        // Nothing here reaches the circuit breaker. Refusing an order below the published
+        // floor is the venue working correctly, and the remedy is the operator's --size
+        // rather than anything about the exchange's health.
+        $tooSmall = $this->orderSizeGuard->reasonsToSkip(
+            $buyExchange,
+            $buyExchangeName,
+            $sellExchange,
+            $sellExchangeName,
+            $message->getSymbol(),
+            $message->getAmount(),
+            $message->getBuyPrice(),
+            $message->getSellPrice()
+        );
+
+        if ($tooSmall !== []) {
+            $this->logger->warning(sprintf(
+                'Execution aborted for opportunity %s: %s. Raise --size on the scanner.',
+                $message->getOpportunityId(),
+                implode(' and ', $tooSmall)
+            ));
+
+            return;
+        }
+
+        // 3. PRE-FLIGHT CHECK: Funding on both venues
         // An exchange only reports an underfunded account by rejecting the order, which here
         // would mean discovering it with the other leg already filled — a partial fill, an
         // emergency unwind and a realized loss, on a trade that was never going to work. Two
@@ -111,7 +144,7 @@ readonly class ExecuteArbitrageHandler
             return;
         }
 
-        // 3. DISPATCH BOTH LEGS OVER THE NETWORK
+        // 4. DISPATCH BOTH LEGS OVER THE NETWORK
         // ccxt's async client returns an already-running promise driven by a
         // non-blocking React HTTP browser, so the SELL request goes on the wire while
         // the BUY is still awaiting its response — genuinely concurrent, not interleaved
@@ -134,7 +167,7 @@ readonly class ExecuteArbitrageHandler
         $results = [];
         $errors = [];
 
-        // 4. WAIT FOR BOTH TO SETTLE
+        // 5. WAIT FOR BOTH TO SETTLE
         // Both legs are already in flight; this just runs the event loop until each has
         // an outcome. Neither leg can be abandoned while its order is still live.
         $settled = await(all($promises));
@@ -149,7 +182,7 @@ readonly class ExecuteArbitrageHandler
 
         $executionTimeMs = (int) ((microtime(true) - $startTime) * 1000);
 
-        // 5. HANDLE EXECUTION OUTCOMES & RISK UNWINDING
+        // 6. HANDLE EXECUTION OUTCOMES & RISK UNWINDING
         if (count($results) === 2) {
             // SUCCESS: Both orders executed simultaneously
             $this->reportSuccess($buyExchangeName, $executionTimeMs);

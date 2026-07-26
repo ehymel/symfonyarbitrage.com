@@ -18,6 +18,20 @@ interface ExchangeServiceInterface
      */
     public function getBalanceAsync(): PromiseInterface;
 
+    /**
+     * The venue's own floor on order size for a symbol, read from the market metadata
+     * that warmUp() loads. A local array lookup — no round trip.
+     *
+     * Either figure may be null, which is ccxt's way of saying the venue states no
+     * minimum of that kind; Kraken publishes both (`ordermin` and `costmin`) while
+     * Coinbase mostly publishes only the cost floor.
+     *
+     * @return array{amount: float|null, cost: float|null}|null the minimum base quantity
+     *         and the minimum quote notional, or null when no market is loaded for the
+     *         symbol and the venue's floor is therefore unknown
+     */
+    public function getMinimumOrderSize(string $symbol): ?array;
+
     public function getOrderBook(string $symbol = 'ETH/USDT', ?int $limit = null): array;
 
     /**

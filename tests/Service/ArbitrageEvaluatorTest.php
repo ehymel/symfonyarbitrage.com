@@ -8,6 +8,7 @@ use App\Service\ArbitrageEvaluator;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\LoggerInterface;
 
 /**
  * The evaluator is pure arithmetic over two order books, so every case here is
@@ -500,7 +501,247 @@ final class ArbitrageEvaluatorTest extends TestCase
         );
     }
 
+    // ------------------------------------------------------ SMALL TARGET SIZING
+
+    /**
+     * A level is a resting order that can be taken in part, not an all-or-nothing block.
+     * A $10 target against a single $1,000 ask level takes 0.01 of the 1.0 on offer and
+     * leaves the rest — the level's size is a ceiling on what can be bought, never a
+     * floor. This is the regime a deliberately small test position runs in, so it is
+     * pinned rather than assumed.
+     */
+    public function testATargetSmallerThanOneBookLevelTakesASliceOfIt(): void
+    {
+        $opportunity = $this->evaluate(
+            asks: [[1000.0, 1.0]],
+            bids: [[1010.0, 1.0]],
+            targetAmountUsd: 10.0,
+        );
+
+        self::assertNotNull($opportunity, '$10 against a $1,000 level is a partial take, not a failure');
+        self::assertEqualsWithDelta(0.01, $opportunity->amount, self::DELTA, '$10 / $1,000');
+        self::assertEqualsWithDelta(1000.0, $opportunity->buyPrice, self::DELTA);
+        self::assertEqualsWithDelta(1010.0, $opportunity->sellPrice, self::DELTA);
+        // revenue 10.10 - cost 10.00, less 0.10% of 10.00 and 0.26% of 10.10.
+        self::assertEqualsWithDelta(0.06374, $opportunity->netProfitUsd, self::DELTA);
+    }
+
+    /**
+     * The same at the extreme: $10 of a six-figure asset is a four-decimal quantity, and
+     * the evaluator still sizes it. It has no notion of a minimum order — that constraint
+     * lives at the venue, and a size below it fails at execution, not here.
+     */
+    public function testAVanishinglySmallSliceOfAHighPricedAssetStillSizes(): void
+    {
+        $opportunity = $this->evaluate(
+            asks: [[100_000.0, 2.0]],
+            bids: [[101_000.0, 2.0]],
+            targetAmountUsd: 10.0,
+        );
+
+        self::assertNotNull($opportunity);
+        self::assertEqualsWithDelta(0.0001, $opportunity->amount, self::DELTA);
+    }
+
+    /**
+     * The mirror of the above, and the branch a small target never reaches: `filled` is
+     * false only once *every* level has been consumed and the target is still unmet, which
+     * means the order was too big for the book rather than too small for a level.
+     */
+    public function testTheUnfilledBranchIsAboutOrdersTooLargeNotTooSmall(): void
+    {
+        // One level worth $1,000 in total; ask for $1,000.01 and the book runs out.
+        self::assertNull($this->evaluate(
+            asks: [[1000.0, 1.0]],
+            bids: [[1010.0, 1.0]],
+            targetAmountUsd: 1_000.01,
+        ));
+
+        // A cent less, and the same book fills it exactly.
+        self::assertNotNull($this->evaluate(
+            asks: [[1000.0, 1.0]],
+            bids: [[1010.0, 1.0]],
+            targetAmountUsd: 1_000.0,
+        ));
+    }
+
+    // ------------------------------------------------- NEAR-MISS REPORTING (DEV)
+
+    /**
+     * The diagnostic exists to answer "is there edge out there that I am not taking?"
+     * while running at a deliberately small size, so what it reports on is every spread
+     * the evaluator looked at and declined — with the numbers that explain the decision.
+     */
+    public function testASpreadRejectedByTheMarginFloorIsNarratedWithItsNumbers(): void
+    {
+        // Buy 1.0 at 100 on binance (0.10%), sell at 100.50 on kraken (0.26%).
+        //   gross  = 0.50%
+        //   fees   = 0.100 + 0.2613 = 0.3613
+        //   net    = 0.50 - 0.3613 = 0.1387  ->  0.1387% margin, under a 0.35% floor
+        $this->evaluateReporting(
+            asks: [[100.0, 10.0]],
+            bids: [[100.50, 10.0]],
+        );
+
+        self::assertCount(1, $this->logged);
+        self::assertStringContainsString('🔍 No trade: BTC/USD buy binance / sell kraken', $this->logged[0]);
+        self::assertStringContainsString('0.5000% gross spread', $this->logged[0]);
+        self::assertStringContainsString('nets 0.1387%', $this->logged[0]);
+        self::assertStringContainsString('($0.1387 on $100.00)', $this->logged[0]);
+        self::assertStringContainsString('under the 0.3500% floor', $this->logged[0]);
+    }
+
+    /**
+     * The case the operator is really asking about at a $10 size: the venues are priced
+     * apart, and the fees alone eat the difference. Reported, because a spread that cannot
+     * pay for itself is the answer to whether the market has edge in it.
+     */
+    public function testASpreadThatFeesFullyConsumeIsStillNarrated(): void
+    {
+        // $10 buys 0.1 at 100 on binance (0.10%), sold at 100.10 on kraken (0.26%).
+        //   gross  = 0.10%          revenue = 10.01
+        //   fees   = 0.010 + 0.026026 = 0.036026
+        //   net    = 0.01 - 0.036026 = -0.026026  ->  -0.2603% margin
+        $this->evaluateReporting(
+            asks: [[100.0, 10.0]],
+            bids: [[100.10, 10.0]],
+            targetAmountUsd: 10.0,
+        );
+
+        self::assertCount(1, $this->logged);
+        self::assertStringContainsString('0.1000% gross spread', $this->logged[0]);
+        self::assertStringContainsString('nets -0.2603%', $this->logged[0]);
+        self::assertStringContainsString('(-$0.0260 on $10.00)', $this->logged[0], 'the sign reads as money lost');
+    }
+
+    /**
+     * The scanner evaluates both directions of every pair, so one of the two is always the
+     * wrong way round. Narrating those would bury the real near misses under a running
+     * commentary on the market being normal.
+     */
+    public function testAnInvertedSpreadIsNotNarrated(): void
+    {
+        $this->evaluateReporting(
+            asks: [[110.0, 10.0]],
+            bids: [[100.0, 10.0]],
+        );
+
+        self::assertSame([], $this->logged);
+    }
+
+    public function testATakenOpportunityIsNotNarrated(): void
+    {
+        $opportunity = $this->evaluateReporting(
+            asks: [[100.0, 10.0]],
+            bids: [[110.0, 10.0]],
+        );
+
+        self::assertNotNull($opportunity);
+        self::assertSame([], $this->logged, 'the detection log already covers what was taken');
+    }
+
+    /**
+     * What the operator originally expected to see. It fires when the order is too *large*
+     * for the book — every visible ask consumed and the target still unmet — so the report
+     * says how far the book actually reached.
+     */
+    public function testABookTooThinToFillTheTargetIsNarratedWithItsDepth(): void
+    {
+        $this->evaluateReporting(
+            asks: [[100.0, 3.0]], // $300 of depth
+            bids: [[110.0, 10.0]],
+            targetAmountUsd: 1_000.0,
+        );
+
+        self::assertCount(1, $this->logged);
+        self::assertStringContainsString('the whole binance ask side is only $300.00', $this->logged[0]);
+        self::assertStringContainsString('short of the $1,000.00 target', $this->logged[0]);
+    }
+
+    public function testABidSideTooThinToTakeTheFillIsNarratedWithItsDepth(): void
+    {
+        $this->evaluateReporting(
+            asks: [[100.0, 10.0]],
+            bids: [[110.0, 0.25]],
+        );
+
+        self::assertCount(1, $this->logged);
+        self::assertStringContainsString('the whole kraken bid side takes only 0.25 of the 1 units', $this->logged[0]);
+    }
+
+    public function testAnEmptyBookIsNarratedWithWhatWasActuallyThere(): void
+    {
+        $this->evaluateReporting(asks: [], bids: [[110.0, 10.0]]);
+
+        self::assertCount(1, $this->logged);
+        self::assertStringContainsString('nothing to compare — 0 ask levels on binance', $this->logged[0]);
+        self::assertStringContainsString('1 bid levels on kraken', $this->logged[0]);
+    }
+
+    /**
+     * Off unless switched on, because the scanner evaluates six spreads four times a
+     * second and this reports on most of them. Production gets none of it.
+     */
+    public function testNothingIsNarratedWhenReportingIsOff(): void
+    {
+        $evaluator = new ArbitrageEvaluator($this->recordingLogger(), reportNearMisses: false);
+
+        $evaluator->evaluate('BTC/USD', 'binance', ['asks' => []], 'kraken', ['bids' => []]);
+
+        self::assertSame([], $this->logged);
+    }
+
+    public function testReportingWithoutALoggerIsHarmless(): void
+    {
+        $evaluator = new ArbitrageEvaluator(logger: null, reportNearMisses: true);
+
+        self::assertNull(
+            $evaluator->evaluate('BTC/USD', 'binance', ['asks' => []], 'kraken', ['bids' => []])
+        );
+    }
+
     // ----------------------------------------------------------------- HELPER
+
+    /** @var list<string> near-miss lines captured from the logger */
+    private array $logged = [];
+
+    /**
+     * Evaluates through an evaluator with dev-mode reporting switched on.
+     *
+     * @param list<array{0: float, 1: float}> $asks
+     * @param list<array{0: float, 1: float}> $bids
+     */
+    private function evaluateReporting(
+        array $asks,
+        array $bids,
+        float $targetAmountUsd = 100.0,
+        float $minNetMarginPct = 0.0035,
+    ): ?ArbitrageOpportunityDto {
+        $evaluator = new ArbitrageEvaluator($this->recordingLogger(), reportNearMisses: true);
+
+        return $evaluator->evaluate(
+            'BTC/USD',
+            'binance',
+            ['asks' => $asks],
+            'kraken',
+            ['bids' => $bids],
+            $targetAmountUsd,
+            $minNetMarginPct,
+        );
+    }
+
+    private function recordingLogger(): LoggerInterface
+    {
+        $logger = $this->createStub(LoggerInterface::class);
+
+        $logger->method('notice')->willReturnCallback(
+            function (string|\Stringable $message): void {
+                $this->logged[] = (string) $message;
+            }
+        );
+
+        return $logger;
+    }
 
     /**
      * @param list<array{0: float, 1: float}> $asks levels on the buy venue

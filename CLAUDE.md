@@ -48,12 +48,16 @@ ArbitrageDetectionScannerCommand      loops every 250ms
   └─ ExecuteArbitrageMessage  ──────► async_trading (Redis)
                                         │
 ExecuteArbitrageHandler ◄───────────────┘
-  1. TradingCircuitBreaker    both venues must be closed
-  2. TradeFundingGuard        both venues must be able to settle their leg
-  3. both legs dispatched concurrently, then settled together
-  4. partial fill → emergency unwind
-  5. TradeExecution row written, whatever happened
+  1. TradingCircuitBreaker    both venues must be closed          (local)
+  2. MinimumOrderSizeGuard    both legs must clear the venue floor (local)
+  3. TradeFundingGuard        both venues must be able to settle their leg (network)
+  4. both legs dispatched concurrently, then settled together
+  5. partial fill → emergency unwind
+  6. TradeExecution row written, whatever happened
 ```
+
+The gates run cheapest first: two local lookups before the balance round trip, so nothing
+spends a network call on a trade that was already disqualified.
 
 `ExchangeServiceInterface` is the only thing that talks to a venue. Every method has an async
 twin (`getBalanceAsync`, `getOrderBookAsync`, `executeMarketOrderAsync`); the synchronous ones
@@ -86,6 +90,11 @@ deliberate risk decision, not a refactor.
 - **Free balance, never total.** Coin committed to open orders cannot be sold twice.
 - **A venue that will not report its balance is not tradeable.** Fail closed; skipping costs
   one opportunity, guessing costs a partial fill.
+- **An order below a venue's published size floor is never sent.** `MinimumOrderSizeGuard`
+  reads `limits.amount.min` and `limits.cost.min` from warmed market metadata. The one
+  deliberate exception to failing closed: *missing* metadata lets the leg through, because
+  warming is best effort, ccxt reloads lazily at order time, and blocking everything over a
+  boot hiccup is the worse failure.
 - **Misconfigured risk controls refuse to start.** A negative safety margin, a non-positive
   position size or an unreadable `--min-margin` stops the process while a human is still
   looking at the terminal, rather than throwing four times a second from inside a loop.

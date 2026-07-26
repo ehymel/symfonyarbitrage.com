@@ -10,6 +10,7 @@ use App\MessageHandler\ExecuteArbitrageHandler;
 use App\Service\AdminAlerter;
 use App\Service\ExchangeFactory;
 use App\Service\ExchangeService\ExchangeServiceInterface;
+use App\Service\MinimumOrderSizeGuard;
 use App\Service\TradeFundingGuard;
 use App\Service\TradingCircuitBreaker;
 use Doctrine\ORM\EntityManagerInterface;
@@ -93,6 +94,12 @@ final class ExecuteArbitrageHandlerTest extends TestCase
     /** @var list<string> venues whose balance was read, in order */
     private array $balanceChecks = [];
 
+    /** No venue floor unless a test says otherwise, so execution tests need not care. */
+    private const array NO_MINIMUM = ['amount' => null, 'cost' => null];
+
+    /** @var array<string, array{amount: float|null, cost: float|null}|null> venue => floors */
+    private array $minimums = [];
+
     /** @var array<string, float> keyed "venue:side" — seconds on the loop before the leg settles */
     private array $delays = [];
 
@@ -148,6 +155,7 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         $this->balanceFailure = null;
         $this->balanceDelaySeconds = 0.0;
         $this->balanceChecks = [];
+        $this->minimums = [];
         $this->notifications = [];
         $this->delays = [];
         $this->venues = [];
@@ -225,6 +233,126 @@ final class ExecuteArbitrageHandlerTest extends TestCase
 
         self::assertSame([], $this->successes);
         self::assertSame([], $this->failures, 'declining to trade is not an exchange failure');
+    }
+
+    // ------------------------------------------------------------- ORDER SIZE GATE
+
+    /**
+     * The failure a deliberately small test position walks into. A venue enforces its size
+     * floor by rejecting the order, so without this gate the discovery happens with the
+     * other leg already filled — a position opened and unwound at a loss over a trade the
+     * exchange was never going to allow.
+     */
+    public function testAnOrderBelowTheSellVenueFloorStopsTheTradeBeforeAnyOrderIsSent(): void
+    {
+        $this->fillBothLegs();
+        $this->minimums[self::SELL_VENUE] = ['amount' => 5.0, 'cost' => null]; // message trades 2.0
+
+        $this->handle();
+
+        self::assertSame([], $this->orders);
+        self::assertSame([], $this->persisted);
+        self::assertSame(0, $this->flushes);
+    }
+
+    public function testAnOrderBelowTheBuyVenueNotionalFloorStopsTheTrade(): void
+    {
+        $this->fillBothLegs();
+        // 2.0 at the quoted 100.0 is $200.
+        $this->minimums[self::BUY_VENUE] = ['amount' => null, 'cost' => 500.0];
+
+        $this->handle();
+
+        self::assertSame([], $this->orders);
+    }
+
+    public function testTheAbortNamesTheVenueTheFloorAndTheFix(): void
+    {
+        $this->fillBothLegs();
+        $this->minimums[self::SELL_VENUE] = ['amount' => 5.0, 'cost' => null];
+
+        $this->handle();
+
+        self::assertContains(
+            'Execution aborted for opportunity 4711: kraken will not sell less than 5 ETH/USDT '
+            . 'and this trade is 2. Raise --size on the scanner.',
+            $this->logMessages(LogLevel::WARNING)
+        );
+    }
+
+    /**
+     * Refusing an order below a published floor is the venue working correctly, and the
+     * remedy is the operator's --size. Charging it to the breaker would take a healthy
+     * exchange out of service over a number typed at the command line.
+     */
+    public function testATooSmallOrderIsNotChargedToTheVenue(): void
+    {
+        $this->fillBothLegs();
+        $this->minimums[self::SELL_VENUE] = ['amount' => 5.0, 'cost' => null];
+
+        $this->handle();
+
+        self::assertSame([], $this->failures);
+        self::assertSame([], $this->successes);
+        self::assertSame([], $this->trips);
+        self::assertSame([], $this->notifications);
+    }
+
+    /** Cheapest gate first: no balance round trip is spent on an unplaceable order. */
+    public function testATooSmallOrderIsCaughtBeforeTheBalanceIsRead(): void
+    {
+        $this->fillBothLegs();
+        $this->minimums[self::SELL_VENUE] = ['amount' => 5.0, 'cost' => null];
+
+        $this->handle();
+
+        self::assertSame([], $this->balanceChecks);
+    }
+
+    public function testAnOrderClearingBothFloorsProceedsToTrade(): void
+    {
+        $this->fillBothLegs();
+        $this->minimums[self::BUY_VENUE] = ['amount' => 0.001, 'cost' => 10.0];
+        $this->minimums[self::SELL_VENUE] = ['amount' => 0.002, 'cost' => 10.0];
+
+        $this->handle();
+
+        self::assertCount(2, $this->orders);
+        self::assertSame('COMPLETED', $this->persistedExecution()->status);
+    }
+
+    /**
+     * The one gate that fails open. Market metadata is warmed best-effort, ccxt reloads it
+     * lazily at order time anyway, and blocking every trade over a boot hiccup is a worse
+     * failure than losing the early warning.
+     */
+    public function testAVenueWithNoMarketDataDoesNotBlockTheTrade(): void
+    {
+        $this->fillBothLegs();
+        $this->minimums[self::SELL_VENUE] = null;
+
+        $this->handle();
+
+        self::assertCount(2, $this->orders);
+        self::assertContains(
+            'No market data for ETH/USDT on kraken, so the sell leg goes out unchecked against the venue minimum.',
+            $this->logMessages(LogLevel::WARNING)
+        );
+    }
+
+    /** An open breaker still short-circuits everything, including the local lookups. */
+    public function testAnOpenBreakerIsStillTheFirstGate(): void
+    {
+        $this->fillBothLegs();
+        $this->allowed[self::BUY_VENUE] = false;
+        $this->minimums[self::SELL_VENUE] = ['amount' => 5.0, 'cost' => null];
+
+        $this->handle();
+
+        self::assertSame(
+            ['Execution aborted by Circuit Breaker for opportunity 4711'],
+            $this->logMessages(LogLevel::WARNING)
+        );
     }
 
     // ---------------------------------------------------------------- FUNDING GATE
@@ -1314,6 +1442,7 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         $handler = new ExecuteArbitrageHandler(
             $this->exchangeFactory(),
             $this->circuitBreaker(),
+            new MinimumOrderSizeGuard($this->recordingLogger()),
             $this->fundingGuard(),
             $this->entityManager(),
             $this->recordingLogger(),
@@ -1435,6 +1564,14 @@ final class ExecuteArbitrageHandlerTest extends TestCase
 
                 return $outcome;
             }
+        );
+
+        // array_key_exists rather than ??, because null is a meaningful value here — it is
+        // how a venue says its market data was never loaded — and ?? would swallow it.
+        $venue->method('getMinimumOrderSize')->willReturnCallback(
+            fn (): ?array => array_key_exists($name, $this->minimums)
+                ? $this->minimums[$name]
+                : self::NO_MINIMUM
         );
 
         // The pre-flight funding check. Left generous by default so the tests that are

@@ -3,6 +3,8 @@
 namespace App\Service;
 
 use App\Dto\ArbitrageOpportunityDto;
+use Psr\Log\LoggerInterface;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
 
 class ArbitrageEvaluator
 {
@@ -15,6 +17,22 @@ class ArbitrageEvaluator
         'kraken'   => 0.0026, // 0.26%
         'binance'  => 0.0010, // 0.10%
     ];
+
+    public function __construct(
+        private readonly ?LoggerInterface $logger = null,
+        /**
+         * Whether to narrate the spreads that were looked at and passed over.
+         *
+         * Wired to kernel.debug, so it is on in dev and off in prod. The scanner evaluates
+         * every pair in both directions four times a second, and this reports on most of
+         * them — useful while working out whether a market has any edge in it, intolerable
+         * as a standing production log. Bound the volume with --limit rather than by
+         * reading less.
+         */
+        #[Autowire('%kernel.debug%')]
+        private readonly bool             $reportNearMisses = false,
+    ) {
+    }
 
     /**
      * Evaluates whether a valid spread exists from Exchange A (Buy) to Exchange B (Sell).
@@ -46,12 +64,29 @@ class ArbitrageEvaluator
         $bids = $sellOrderBook['bids'] ?? []; // Buyers on Exchange B [[price, qty], ...]
 
         if (empty($asks) || empty($bids)) {
+            $this->reportNearMiss($symbol, $buyExchangeName, $sellExchangeName, sprintf(
+                'nothing to compare — %d ask levels on %s, %d bid levels on %s',
+                count($asks),
+                $buyExchangeName,
+                count($bids),
+                $sellExchangeName
+            ));
+
             return null;
         }
 
         // 1. Calculate weighted average BUY price to acquire the target amount
         $buyResult = $this->calculateBuyCost($asks, $targetAmountUsd);
         if (!$buyResult['filled']) {
+            // The order is too *large* for the book, not too small: every visible ask has
+            // been consumed and the target notional is still not met.
+            $this->reportNearMiss($symbol, $buyExchangeName, $sellExchangeName, sprintf(
+                'the whole %s ask side is only $%s, short of the $%s target',
+                $buyExchangeName,
+                number_format($buyResult['total_cost_usd'], 2),
+                number_format($targetAmountUsd, 2)
+            ));
+
             return null; // Insufficient liquidity on order book
         }
 
@@ -62,6 +97,13 @@ class ArbitrageEvaluator
         // 2. Calculate weighted average SELL revenue for that exact crypto quantity
         $sellResult = $this->calculateSellRevenue($bids, $cryptoQty);
         if (!$sellResult['filled']) {
+            $this->reportNearMiss($symbol, $buyExchangeName, $sellExchangeName, sprintf(
+                'the whole %s bid side takes only %s of the %s units the buy would acquire',
+                $sellExchangeName,
+                rtrim(rtrim(number_format($sellResult['qty'], 8), '0'), '.'),
+                rtrim(rtrim(number_format($cryptoQty, 8), '0'), '.')
+            ));
+
             return null; // Insufficient bid liquidity on Exchange B
         }
 
@@ -80,12 +122,29 @@ class ArbitrageEvaluator
         $netProfitUsd = ($totalSellRevenueUsd - $totalBuyCostUsd) - $totalFeesUsd;
         $netMarginPct = $netProfitUsd / $totalBuyCostUsd;
 
+        $grossSpreadPct = ($effectiveSellPrice - $effectiveBuyPrice) / $effectiveBuyPrice;
+
         // 5. Margin Threshold Check
         if ($netMarginPct < $minNetMarginPct) {
+            // Only worth narrating when the venues really were priced apart in this
+            // direction. The scanner evaluates both directions of every pair, so one of
+            // the two is always the wrong way round — reporting those would bury the near
+            // misses under a running commentary on the market being normal.
+            if ($grossSpreadPct > 0.0) {
+                $this->reportNearMiss($symbol, $buyExchangeName, $sellExchangeName, sprintf(
+                    '%s%% gross spread nets %s%% (%s on $%s) after fees, under the %s%% floor',
+                    number_format($grossSpreadPct * 100, 4),
+                    number_format($netMarginPct * 100, 4),
+                    // Sign outside the currency symbol, so a trade that loses money at this
+                    // size reads as -$0.03 rather than $-0.03.
+                    sprintf('%s$%s', $netProfitUsd < 0.0 ? '-' : '', number_format(abs($netProfitUsd), 4)),
+                    number_format($totalBuyCostUsd, 2),
+                    number_format($minNetMarginPct * 100, 4)
+                ));
+            }
+
             return null;
         }
-
-        $grossSpreadPct = ($effectiveSellPrice - $effectiveBuyPrice) / $effectiveBuyPrice;
 
         return new ArbitrageOpportunityDto(
             pair: $symbol,
@@ -99,6 +158,36 @@ class ArbitrageEvaluator
         );
     }
 
+    /**
+     * Narrates a spread that was looked at and passed over.
+     *
+     * Notice rather than info, so it reaches the console at -v while the scanner's own
+     * output stays readable without it; either way it lands in the dev log. Silent in
+     * production — see the constructor.
+     */
+    private function reportNearMiss(
+        string $symbol,
+        string $buyExchangeName,
+        string $sellExchangeName,
+        string $reason,
+    ): void {
+        if (!$this->reportNearMisses || $this->logger === null) {
+            return;
+        }
+
+        $this->logger->notice(sprintf(
+            '🔍 No trade: %s buy %s / sell %s — %s',
+            $symbol,
+            $buyExchangeName,
+            $sellExchangeName,
+            $reason
+        ));
+    }
+
+    /**
+     * The accumulated totals come back on failure as well as success: they are what makes
+     * a near-miss report say how far short the book fell rather than merely that it did.
+     */
     private function calculateBuyCost(array $asks, float $targetUsd): array
     {
         $accumulatedUsd = 0.0;
@@ -121,7 +210,7 @@ class ArbitrageEvaluator
             $accumulatedQty += $qty;
         }
 
-        return ['filled' => false];
+        return ['filled' => false, 'qty' => $accumulatedQty, 'total_cost_usd' => $accumulatedUsd];
     }
 
     private function calculateSellRevenue(array $bids, float $targetQty): array
@@ -142,6 +231,6 @@ class ArbitrageEvaluator
             $accumulatedRevenueUsd += ($qty * $price);
         }
 
-        return ['filled' => false];
+        return ['filled' => false, 'qty' => $accumulatedQty, 'total_revenue_usd' => $accumulatedRevenueUsd];
     }
 }
