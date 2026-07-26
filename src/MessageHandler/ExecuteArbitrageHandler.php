@@ -6,6 +6,7 @@ use App\Entity\ArbitrageOpportunity;
 use App\Entity\TradeExecution;
 use App\Message\ExecuteArbitrageMessage;
 use App\Service\ExchangeFactory;
+use App\Service\ExchangeService\ExchangeServiceInterface;
 use App\Service\TradingCircuitBreaker;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Exception\ORMException;
@@ -14,20 +15,20 @@ use GuzzleHttp\Promise\Utils;
 use Psr\Cache\InvalidArgumentException;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Messenger\Attribute\AsMessageHandler;
+use Symfony\Component\Notifier\Exception\TransportExceptionInterface;
 
 #[AsMessageHandler]
-class ExecuteArbitrageHandler
+readonly class ExecuteArbitrageHandler
 {
     public function __construct(
-        private readonly ExchangeFactory $exchangeFactory,
-        private readonly TradingCircuitBreaker $circuitBreaker,
-        private readonly EntityManagerInterface $em,
-        private readonly LoggerInterface $logger
+        private ExchangeFactory        $exchangeFactory,
+        private TradingCircuitBreaker  $circuitBreaker,
+        private EntityManagerInterface $em,
+        private LoggerInterface        $logger
     ) {}
 
     /**
-     * @throws InvalidArgumentException
-     * @throws ORMException
+     * @throws InvalidArgumentException|ORMException|TransportExceptionInterface
      */
     public function __invoke(ExecuteArbitrageMessage $message): void
     {
@@ -51,9 +52,8 @@ class ExecuteArbitrageHandler
         $buyPromise = new Promise(function () use (&$buyPromise, $buyExchange, $message) {
             try {
                 // Execute Market BUY on Exchange A
-                $order = $buyExchange->create_order(
+                $order = $buyExchange->executeMarketOrder(
                     $message->getSymbol(),
-                    'market',
                     'buy',
                     $message->getAmount()
                 );
@@ -66,9 +66,8 @@ class ExecuteArbitrageHandler
         $sellPromise = new Promise(function () use (&$sellPromise, $sellExchange, $message) {
             try {
                 // Execute Market SELL on Exchange B
-                $order = $sellExchange->create_order(
+                $order = $sellExchange->executeMarketOrder(
                     $message->getSymbol(),
-                    'market',
                     'sell',
                     $message->getAmount()
                 );
@@ -138,10 +137,10 @@ class ExecuteArbitrageHandler
     /**
      * Emergency Unwind: Immediately market-reverses an orphaned trade to flatten position.
      */
-    private function unwindPosition($exchange, string $symbol, string $side, float $amount): void
+    private function unwindPosition(ExchangeServiceInterface $exchange, string $symbol, string $side, float $amount): void
     {
         try {
-            $exchange->create_order($symbol, 'market', $side, $amount);
+            $exchange->executeMarketOrder($symbol, $side, $amount);
             $this->logger->info("Position successfully unwound via market {$side}.");
         } catch (\Throwable $e) {
             $this->logger->emergency("CRITICAL FAILURE: Emergency unwind failed! Manual intervention required! Error: " . $e->getMessage());

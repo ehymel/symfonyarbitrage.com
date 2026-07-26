@@ -107,8 +107,7 @@ class ArbitrageDetectionScannerCommand extends Command
         foreach ($instances as $name => $exchange) {
             $promises[$name] = new Promise(function () use (&$promises, $exchange, $name, $symbol) {
                 try {
-                    // CCXT order book fetch call
-                    $book = $exchange->fetch_order_book($symbol, 10); // Fetch top 10 order book levels
+                    $book = $exchange->getOrderBook($symbol, 10); // Fetch top 10 order book levels
                     $promises[$name]->resolve($book);
                 } catch (\Throwable $e) {
                     $promises[$name]->reject($e);

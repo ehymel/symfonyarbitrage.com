@@ -4,14 +4,12 @@ namespace App\Service\ExchangeService;
 
 use ccxt\coinbase;
 use ccxt\ExchangeError;
-use ccxt\InvalidOrder;
-use ccxt\NotSupported;
+use Symfony\Component\DependencyInjection\Attribute\AsTaggedItem;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
 
-class CoinbaseExchangeService
+#[AsTaggedItem(index: 'coinbase')]
+class CoinbaseExchangeService extends AbstractCcxtExchangeService
 {
-    private coinbase $exchange;
-
     /**
      * @throws ExchangeError
      */
@@ -20,37 +18,11 @@ class CoinbaseExchangeService
         #[Autowire(env: 'COINBASE_API_SECRET')] string $apiSecret,
     )
     {
-        $this->exchange = new coinbase([
-            'apiKey' => $apiKey,
-            'secret' => $apiSecret,
-            'enableRateLimit' => true,
-        ]);
+        parent::__construct($apiKey, $apiSecret);
     }
 
-    public function getBalance(): array
+    protected static function ccxtClass(): string
     {
-        return $this->exchange->fetch_balance();
-    }
-
-    public function getOrderBook(string $symbol = 'ETH/USDT'): array
-    {
-        return $this->exchange->fetch_order_book($symbol);
-    }
-
-    /**
-     * @throws ExchangeError
-     * @throws InvalidOrder
-     * @throws NotSupported
-     */
-    public function executeMarketOrder(string $symbol, string $side, float $amount): array
-    {
-        // $side = 'buy' or 'sell'
-        $buyOrSell = match($side) {
-            'buy' => 'BUY',
-            'sell' => 'SELL',
-            default => throw new \InvalidArgumentException('Invalid side value'),
-        };
-
-        return $this->exchange->create_order($symbol, 'market', $buyOrSell, $amount);
+        return coinbase::class;
     }
 }
