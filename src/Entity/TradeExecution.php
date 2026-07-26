@@ -16,19 +16,19 @@ class TradeExecution
     #[ORM\JoinColumn(nullable: false)]
     public ?ArbitrageOpportunity $opportunity = null;
 
-    #[ORM\Column(length: 100)]
+    #[ORM\Column(length: 100, nullable: true)]
     public ?string $buyOrderId = null;
 
-    #[ORM\Column(length: 100)]
+    #[ORM\Column(length: 100, nullable: true)]
     public ?string $sellOrderId = null;
 
-    #[ORM\Column(type: Types::DECIMAL, precision: 18, scale: 8)]
+    #[ORM\Column(type: Types::DECIMAL, precision: 18, scale: 8, nullable: true)]
     public ?string $buyFilledPrice = null;
 
-    #[ORM\Column(type: Types::DECIMAL, precision: 18, scale: 8)]
+    #[ORM\Column(type: Types::DECIMAL, precision: 18, scale: 8, nullable: true)]
     public ?string $sellFilledPrice = null;
 
-    #[ORM\Column(type: Types::DECIMAL, precision: 10, scale: 4)]
+    #[ORM\Column(type: Types::DECIMAL, precision: 10, scale: 4, nullable: true)]
     public ?string $actualProfitUSD = null;
 
     #[ORM\Column(length: 30)]
