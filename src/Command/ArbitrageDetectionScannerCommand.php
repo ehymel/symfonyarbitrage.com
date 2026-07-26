@@ -167,6 +167,7 @@ class ArbitrageDetectionScannerCommand extends Command
 
                             // Pre-flight check via Circuit Breaker
                             if (!$this->circuitBreaker->isAllowed($buyEx) || !$this->circuitBreaker->isAllowed($sellEx)) {
+                                $output->writeln("❌ Circuit breaker tripped for: " . $buyEx . " and " . $sellEx);
                                 continue;
                             }
 
@@ -183,7 +184,7 @@ class ArbitrageDetectionScannerCommand extends Command
                             );
 
                             if ($opportunity) {
-                                $this->handleOpportunityDetected($opportunity);
+                                $this->handleOpportunityDetected($opportunity, $output);
                             }
                         }
                     }
@@ -298,10 +299,7 @@ class ArbitrageDetectionScannerCommand extends Command
      *
      * @return bool true when the run must stop
      */
-    private function haltAfterPersistenceFailure(
-        OpportunityPersistenceFailed $failure,
-        OutputInterface $output
-    ): bool {
+    private function haltAfterPersistenceFailure(OpportunityPersistenceFailed $failure, OutputInterface $output): bool {
         $reason = $failure->getMessage();
         $this->logger->critical($reason);
 
@@ -348,8 +346,9 @@ class ArbitrageDetectionScannerCommand extends Command
      * Persists opportunity to RDS and dispatches Messenger execution job.
      * @throws ExceptionInterface|OpportunityPersistenceFailed
      */
-    private function handleOpportunityDetected($dto): void
+    private function handleOpportunityDetected($dto, OutputInterface $output): void
     {
+        $output->writeln("⚡ ARBITRAGE DETECTED! " . $dto->pair . " | Buy " . $dto->buyExchange . " @ $" . $dto->buyPrice . " | Sell " . $dto->sellExchange . " @ $" . $dto->sellPrice . " | Est. Profit: $" . $dto->netProfitUsd);
         $this->logger->info(sprintf(
             "⚡ ARBITRAGE DETECTED! %s | Buy %s @ $%.2f | Sell %s @ $%.2f | Est. Profit: $%.4f",
             $dto->pair, $dto->buyExchange, $dto->buyPrice, $dto->sellExchange, $dto->sellPrice, $dto->netProfitUsd
