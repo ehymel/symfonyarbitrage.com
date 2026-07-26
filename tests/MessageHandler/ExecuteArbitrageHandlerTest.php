@@ -7,8 +7,10 @@ use App\Entity\ArbitrageOpportunity;
 use App\Entity\TradeExecution;
 use App\Message\ExecuteArbitrageMessage;
 use App\MessageHandler\ExecuteArbitrageHandler;
+use App\Service\AdminAlerter;
 use App\Service\ExchangeFactory;
 use App\Service\ExchangeService\ExchangeServiceInterface;
+use App\Service\TradeFundingGuard;
 use App\Service\TradingCircuitBreaker;
 use Doctrine\ORM\EntityManagerInterface;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -19,10 +21,14 @@ use Psr\Log\LogLevel;
 use React\EventLoop\Loop;
 use React\Promise\Deferred;
 use React\Promise\PromiseInterface;
+use Symfony\Component\Cache\Adapter\ArrayAdapter;
 use Symfony\Component\DependencyInjection\ServiceLocator;
 use Symfony\Component\Notifier\Message\MessageInterface;
 use Symfony\Component\Notifier\Message\SentMessage;
 use Symfony\Component\Notifier\Message\SmsMessage;
+use Symfony\Component\Notifier\Notification\Notification;
+use Symfony\Component\Notifier\NotifierInterface;
+use Symfony\Component\Notifier\Recipient\RecipientInterface;
 use Symfony\Component\Notifier\TexterInterface;
 
 /**
@@ -69,6 +75,24 @@ final class ExecuteArbitrageHandlerTest extends TestCase
     /** @var array<string, array|\Throwable|\Closure> keyed "venue:side" */
     private array $outcomes = [];
 
+    /** Free balances per venue. Unset means "well funded", so most tests need not care. */
+    private const array WELL_FUNDED = ['ETH' => 1_000.0, 'BTC' => 1_000.0, 'USDT' => 1_000_000.0];
+
+    /** The quote cost of the message's trade: 2.0 ETH at the quoted 100.0. */
+    private const float BUY_COST = 200.0;
+
+    /** @var array<string, array<string, float>> venue => asset => free balance */
+    private array $balances = [];
+
+    /** When set, every balance read throws — the venue's private endpoint is out. */
+    private ?\Throwable $balanceFailure = null;
+
+    /** Seconds the balance read stalls on the clock, to time the pre-flight round trip. */
+    private float $balanceDelaySeconds = 0.0;
+
+    /** @var list<string> venues whose balance was read, in order */
+    private array $balanceChecks = [];
+
     /** @var array<string, float> keyed "venue:side" — seconds on the loop before the leg settles */
     private array $delays = [];
 
@@ -107,6 +131,9 @@ final class ExecuteArbitrageHandlerTest extends TestCase
     /** @var list<SmsMessage> */
     private array $sentMessages = [];
 
+    /** @var list<Notification> raised through the AdminAlerter rather than the raw texter */
+    private array $notifications = [];
+
     /** Set to have the SMS transport blow up, simulating a texting outage. */
     private ?\Throwable $texterFailure = null;
 
@@ -117,6 +144,11 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         $this->breakerOutage = null;
         $this->trips = [];
         $this->outcomes = [];
+        $this->balances = [];
+        $this->balanceFailure = null;
+        $this->balanceDelaySeconds = 0.0;
+        $this->balanceChecks = [];
+        $this->notifications = [];
         $this->delays = [];
         $this->venues = [];
         $this->orders = [];
@@ -193,6 +225,222 @@ final class ExecuteArbitrageHandlerTest extends TestCase
 
         self::assertSame([], $this->successes);
         self::assertSame([], $this->failures, 'declining to trade is not an exchange failure');
+    }
+
+    // ---------------------------------------------------------------- FUNDING GATE
+
+    /**
+     * An exchange only reports an underfunded account by rejecting the order — which,
+     * without this gate, happens with the other leg already filled. That is the partial-fill
+     * path: a live position, an emergency unwind and a realized loss, on a trade that could
+     * never have worked.
+     */
+    public function testASellVenueShortOfCoinStopsTheTradeBeforeAnyOrderIsSent(): void
+    {
+        $this->fillBothLegs();
+        $this->balances[self::SELL_VENUE] = ['ETH' => 0.5]; // the message asks for 2.0
+
+        $this->handle();
+
+        self::assertSame([], $this->orders, 'nothing may be bought that cannot then be sold');
+        self::assertSame([], $this->persisted);
+        self::assertSame(0, $this->flushes);
+    }
+
+    /**
+     * The mirror image, and the reason the buy leg is checked at all: a buy rejected for
+     * want of cash while the sell fills leaves the account short of coin it never had.
+     */
+    public function testABuyVenueShortOfCashStopsTheTradeBeforeAnyOrderIsSent(): void
+    {
+        $this->fillBothLegs();
+        $this->balances[self::BUY_VENUE] = ['USDT' => self::BUY_COST - 1]; // 2.0 ETH at 100 costs 200
+
+        $this->handle();
+
+        self::assertSame([], $this->orders, 'a sell with nothing bought to cover it is a naked short');
+        self::assertSame([], $this->persisted);
+    }
+
+    /**
+     * The buy leg spends quote currency, not the asset it is acquiring. Checking the wrong
+     * side of the pair would read a wallet full of ETH as clearance to buy more of it.
+     */
+    public function testTheBuyLegIsClearedAgainstTheQuoteCurrency(): void
+    {
+        $this->fillBothLegs();
+        $this->balances[self::BUY_VENUE] = ['ETH' => 1_000.0];
+
+        $this->handle();
+
+        self::assertSame([], $this->orders);
+    }
+
+    /**
+     * Being short is our own funding problem and says nothing about the exchange. Charging
+     * it to the breaker would take a perfectly healthy venue out of service over an account
+     * we failed to top up.
+     */
+    #[DataProvider('underfundedVenueProvider')]
+    public function testAnUnderfundedAccountIsNotChargedToTheVenue(string $venue): void
+    {
+        $this->fillBothLegs();
+        $this->balances[$venue] = [];
+
+        $this->handle();
+
+        self::assertSame([], $this->failures);
+        self::assertSame([], $this->successes);
+        self::assertSame([], $this->trips);
+    }
+
+    public static function underfundedVenueProvider(): iterable
+    {
+        yield 'buy venue' => [self::BUY_VENUE];
+        yield 'sell venue' => [self::SELL_VENUE];
+    }
+
+    public function testTheAbortNamesTheOpportunityAndTheLegThatCouldNotBeCleared(): void
+    {
+        $this->fillBothLegs();
+        $this->balances[self::SELL_VENUE] = [];
+
+        $this->handle();
+
+        self::assertContains(
+            'Execution aborted for opportunity 4711: kraken cannot cover the sell leg.',
+            $this->logMessages(LogLevel::WARNING)
+        );
+    }
+
+    /** Two empty accounts are two things for the on-call to fix, so the log says both. */
+    public function testATradeBlockedOnBothSidesNamesBothLegs(): void
+    {
+        $this->fillBothLegs();
+        $this->balances[self::BUY_VENUE] = [];
+        $this->balances[self::SELL_VENUE] = [];
+
+        $this->handle();
+
+        self::assertContains(
+            'Execution aborted for opportunity 4711: coinbase cannot fund the buy leg '
+            . 'and kraken cannot cover the sell leg.',
+            $this->logMessages(LogLevel::WARNING)
+        );
+    }
+
+    /** Nothing else reports it: the breaker never sees a shortfall, so the guard pages. */
+    public function testAnEmptyAccountReachesTheAdmin(): void
+    {
+        $this->fillBothLegs();
+        $this->balances[self::SELL_VENUE] = [];
+
+        $this->handle();
+
+        self::assertCount(1, $this->notifications);
+        self::assertSame(
+            '⚠️ Out of ETH on kraken — arbitrage sells are being skipped',
+            $this->notifications[0]->getSubject()
+        );
+    }
+
+    public function testBothVenuesAreClearedBeforeExecution(): void
+    {
+        $this->fillBothLegs();
+
+        $this->handle();
+
+        self::assertSame([self::BUY_VENUE, self::SELL_VENUE], $this->balanceChecks);
+        self::assertCount(2, $this->orders);
+        self::assertSame('COMPLETED', $this->persistedExecution()->status);
+    }
+
+    /**
+     * Fail closed. Not knowing whether a leg can settle is precisely the state this gate
+     * exists to avoid trading through.
+     */
+    public function testAnUnreadableBalanceStopsTheTrade(): void
+    {
+        $this->fillBothLegs();
+        $this->balanceFailure = new \RuntimeException('403 Invalid API key');
+
+        $this->handle();
+
+        self::assertSame([], $this->orders);
+        self::assertSame([], $this->persisted);
+    }
+
+    /**
+     * ...but unlike a shortfall, this one *is* the venue's fault. A private endpoint that
+     * will not answer is exactly what the breaker exists to notice. Both venues are out
+     * here, so both are charged — one incident per circuit.
+     */
+    public function testAnUnreadableBalanceIsChargedToTheVenue(): void
+    {
+        $this->fillBothLegs();
+        $this->balanceFailure = new \RuntimeException('403 Invalid API key');
+
+        $this->handle();
+
+        self::assertSame([
+            [self::BUY_VENUE, 'Balance check failed before execution'],
+            [self::SELL_VENUE, 'Balance check failed before execution'],
+        ], $this->failures);
+        self::assertSame([], $this->notifications, 'the breaker already reports venue trouble');
+    }
+
+    /** The gate order: the free local check first, the network round trip only if it passes. */
+    public function testAnOpenBreakerSkipsTheBalanceReadEntirely(): void
+    {
+        $this->fillBothLegs();
+        $this->allowed[self::SELL_VENUE] = false;
+
+        $this->handle();
+
+        self::assertSame([], $this->balanceChecks);
+    }
+
+    /**
+     * The pre-flight round trip is ours, not the venue's. Timing it alongside the legs would
+     * bill an extra ~100-300ms of our own latency to the breaker's budget and trip venues
+     * that answered promptly.
+     */
+    public function testThePreFlightRoundTripIsNotBilledToTheVenuesLatency(): void
+    {
+        $this->fillBothLegs();
+        $this->balanceDelaySeconds = 0.04;
+
+        $this->handle();
+
+        self::assertLessThan(
+            30,
+            $this->persistedExecution()->executionTimeMs,
+            'the 40ms balance read must fall outside the measured window'
+        );
+    }
+
+    /**
+     * The unwind is never gated, for the same reason it never consults the breaker: it
+     * reduces risk rather than taking it. It is moot besides — the fill being reversed has
+     * itself just delivered whatever the reversing order spends.
+     */
+    public function testTheUnwindIsNotGatedByFunding(): void
+    {
+        $this->partialBuy();
+        $this->balances[self::BUY_VENUE] = ['USDT' => 1_000.0]; // enough to buy, no ETH to sell back
+
+        $this->handle();
+
+        self::assertSame(
+            ['coinbase:buy', 'kraken:sell', 'coinbase:sell'],
+            array_map(static fn (array $o): string => "{$o['venue']}:{$o['side']}", $this->orders)
+        );
+        self::assertSame('PARTIAL_BUY_UNWOUND', $this->persistedExecution()->status);
+        self::assertSame(
+            [self::BUY_VENUE, self::SELL_VENUE],
+            $this->balanceChecks,
+            'the unwind asks nobody for permission'
+        );
     }
 
     // ------------------------------------------------------------------ HAPPY PATH
@@ -1066,6 +1314,7 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         $handler = new ExecuteArbitrageHandler(
             $this->exchangeFactory(),
             $this->circuitBreaker(),
+            $this->fundingGuard(),
             $this->entityManager(),
             $this->recordingLogger(),
             $this->recordingTexter(),
@@ -1188,11 +1437,67 @@ final class ExecuteArbitrageHandlerTest extends TestCase
             }
         );
 
+        // The pre-flight funding check. Left generous by default so the tests that are
+        // about execution never have to think about funding.
+        $venue->method('getBalanceAsync')->willReturnCallback(
+            function () use ($name): PromiseInterface {
+                $this->balanceChecks[] = $name;
+
+                $deferred = new Deferred();
+
+                Loop::addTimer($this->balanceDelaySeconds, function () use ($deferred, $name): void {
+                    if ($this->balanceFailure !== null) {
+                        $deferred->reject($this->balanceFailure);
+
+                        return;
+                    }
+
+                    $free = $this->balances[$name] ?? self::WELL_FUNDED;
+
+                    $deferred->resolve(['free' => $free, 'used' => [], 'total' => $free]);
+                });
+
+                return $deferred->promise();
+            }
+        );
+
         $venue->method('warmUp')->willReturnCallback(
             fn (): PromiseInterface => $this->resolved()
         );
 
         return $venue;
+    }
+
+    /**
+     * A real guard over a real cache, rather than a double. The contract under test here is
+     * what the handler does with each verdict, and driving the genuine article also pins
+     * that the two are wired together the way the guard's own tests assume.
+     */
+    private function fundingGuard(): TradeFundingGuard
+    {
+        return new TradeFundingGuard(
+            new ArrayAdapter(),
+            new AdminAlerter(
+                $this->recordingNotifier(),
+                $this->recordingLogger(),
+                self::ADMIN_PHONE,
+                'ops@example.com'
+            ),
+            $this->recordingLogger(),
+        );
+    }
+
+    private function recordingNotifier(): NotifierInterface
+    {
+        $notifier = $this->createStub(NotifierInterface::class);
+
+        $notifier->method('send')->willReturnCallback(
+            function (Notification $notification, RecipientInterface ...$recipients): void {
+                $this->notifications[] = $notification;
+            }
+        );
+
+        return $notifier;
     }
 
     /**

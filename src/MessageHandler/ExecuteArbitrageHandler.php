@@ -7,6 +7,8 @@ use App\Entity\TradeExecution;
 use App\Message\ExecuteArbitrageMessage;
 use App\Service\ExchangeFactory;
 use App\Service\ExchangeService\ExchangeServiceInterface;
+use App\Service\FundingVerdict;
+use App\Service\TradeFundingGuard;
 use App\Service\TradingCircuitBreaker;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Exception\ORMException;
@@ -28,6 +30,7 @@ readonly class ExecuteArbitrageHandler
     public function __construct(
         private ExchangeFactory        $exchangeFactory,
         private TradingCircuitBreaker  $circuitBreaker,
+        private TradeFundingGuard      $fundingGuard,
         private EntityManagerInterface $em,
         private LoggerInterface        $logger,
         private TexterInterface        $texter,
@@ -55,7 +58,60 @@ readonly class ExecuteArbitrageHandler
         $buyExchange = $this->exchangeFactory->create($buyExchangeName);
         $sellExchange = $this->exchangeFactory->create($sellExchangeName);
 
-        // 2. DISPATCH BOTH LEGS OVER THE NETWORK
+        // 2. PRE-FLIGHT CHECK: Funding on both venues
+        // An exchange only reports an underfunded account by rejecting the order, which here
+        // would mean discovering it with the other leg already filled — a partial fill, an
+        // emergency unwind and a realized loss, on a trade that was never going to work. Two
+        // concurrent balance reads beforehand make that a skipped opportunity instead.
+        //
+        // Deliberately outside the timing window opened below: the round trip is ours, not
+        // the venues', and billing it to the breaker's latency budget would trip venues for
+        // a call they answered promptly.
+        //
+        // Either leg failing cancels both. A buy with no exit is not an arbitrage, and
+        // neither is an exit with nothing to sell — the same reasoning as the breaker gate.
+        $funding = $this->fundingGuard->clearLegs(
+            $buyExchange,
+            $buyExchangeName,
+            $sellExchange,
+            $sellExchangeName,
+            $message->getSymbol(),
+            $message->getAmount(),
+            $message->getBuyPrice()
+        );
+
+        if (!$funding->bothLegsCleared()) {
+            // Only an unreadable balance is charged to its venue. Being short is our own
+            // funding problem and says nothing about the exchange, whereas a private
+            // endpoint that will not answer is exactly what the breaker exists to notice.
+            // A list rather than a venue-keyed map: both legs can route to the same venue,
+            // and that circuit is owed both reports.
+            foreach ([[$buyExchangeName, $funding->buy], [$sellExchangeName, $funding->sell]] as [$venue, $verdict]) {
+                if ($verdict === FundingVerdict::Unknown) {
+                    $this->reportFailure($venue, 'Balance check failed before execution');
+                }
+            }
+
+            $blocked = [];
+
+            if ($funding->buy !== FundingVerdict::Sufficient) {
+                $blocked[] = "{$buyExchangeName} cannot fund the buy leg";
+            }
+
+            if ($funding->sell !== FundingVerdict::Sufficient) {
+                $blocked[] = "{$sellExchangeName} cannot cover the sell leg";
+            }
+
+            $this->logger->warning(sprintf(
+                'Execution aborted for opportunity %s: %s.',
+                $message->getOpportunityId(),
+                implode(' and ', $blocked)
+            ));
+
+            return;
+        }
+
+        // 3. DISPATCH BOTH LEGS OVER THE NETWORK
         // ccxt's async client returns an already-running promise driven by a
         // non-blocking React HTTP browser, so the SELL request goes on the wire while
         // the BUY is still awaiting its response — genuinely concurrent, not interleaved
@@ -78,7 +134,7 @@ readonly class ExecuteArbitrageHandler
         $results = [];
         $errors = [];
 
-        // 3. WAIT FOR BOTH TO SETTLE
+        // 4. WAIT FOR BOTH TO SETTLE
         // Both legs are already in flight; this just runs the event loop until each has
         // an outcome. Neither leg can be abandoned while its order is still live.
         $settled = await(all($promises));
@@ -93,7 +149,7 @@ readonly class ExecuteArbitrageHandler
 
         $executionTimeMs = (int) ((microtime(true) - $startTime) * 1000);
 
-        // 4. HANDLE EXECUTION OUTCOMES & RISK UNWINDING
+        // 5. HANDLE EXECUTION OUTCOMES & RISK UNWINDING
         if (count($results) === 2) {
             // SUCCESS: Both orders executed simultaneously
             $this->reportSuccess($buyExchangeName, $executionTimeMs);
@@ -173,7 +229,9 @@ readonly class ExecuteArbitrageHandler
      * than taking it, and the venue holding the position may well have just been tripped
      * by the same incident that created it — on a same-venue trade, by the leg failure a
      * few lines above. Gating this call could strand an open position behind a cooldown,
-     * which is the opposite of what the breaker is for.
+     * which is the opposite of what the breaker is for. The funding check is skipped for the
+     * same reason, and is moot besides: the fill being reversed has itself just delivered
+     * whatever the reversing order spends.
      *
      * @return array|null the reversing order, or null if the position is STILL OPEN
      */

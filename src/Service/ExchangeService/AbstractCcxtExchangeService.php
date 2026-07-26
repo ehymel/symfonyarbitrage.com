@@ -45,7 +45,15 @@ abstract class AbstractCcxtExchangeService implements ExchangeServiceInterface
      */
     public function getBalance(): array
     {
-        return await($this->exchange->fetch_balance());
+        return await($this->getBalanceAsync());
+    }
+
+    /**
+     * @throws NotSupported
+     */
+    public function getBalanceAsync(): PromiseInterface
+    {
+        return $this->exchange->fetch_balance();
     }
 
     /**

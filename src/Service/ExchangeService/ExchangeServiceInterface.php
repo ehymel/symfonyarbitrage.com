@@ -10,6 +10,14 @@ interface ExchangeServiceInterface
 {
     public function getBalance(): array;
 
+    /**
+     * Non-blocking counterpart to getBalance(), so a pre-trade funding check can hold a
+     * read open against both venues at once rather than paying for them in sequence.
+     *
+     * @return PromiseInterface<array> resolves with the ccxt balance structure
+     */
+    public function getBalanceAsync(): PromiseInterface;
+
     public function getOrderBook(string $symbol = 'ETH/USDT', ?int $limit = null): array;
 
     /**
