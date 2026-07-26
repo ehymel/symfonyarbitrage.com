@@ -3,6 +3,10 @@
 namespace App\Service;
 
 use Psr\Cache\InvalidArgumentException;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
+use Symfony\Component\Notifier\Exception\TransportExceptionInterface;
+use Symfony\Component\Notifier\Message\SmsMessage;
+use Symfony\Component\Notifier\TexterInterface;
 use Symfony\Contracts\Cache\CacheInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Notifier\NotifierInterface;
@@ -16,11 +20,12 @@ class TradingCircuitBreaker
 
     public function __construct(
         private CacheInterface $cache,
-        private NotifierInterface $notifier,
+        private TexterInterface $texter,
         private LoggerInterface $logger,
         private int $maxFailures = 2,
         private int $maxLatencyMs = 450,
-        private int $cooldownSeconds = 300 // 5-minute pause
+        private int $cooldownSeconds = 300, // 5-minute pause
+        #[Autowire(env: 'ADMIN_PHONE_NUMBER')] private string $adminPhoneNumber,
     ) {}
 
     /**
@@ -56,6 +61,7 @@ class TradingCircuitBreaker
     /**
      * Record API execution metrics.
      * @throws InvalidArgumentException
+     * @throws TransportExceptionInterface
      */
     public function recordSuccess(string $exchange, int $executionTimeMs): void
     {
@@ -98,7 +104,7 @@ class TradingCircuitBreaker
     }
 
     /**
-     * @throws InvalidArgumentException
+     * @throws InvalidArgumentException|TransportExceptionInterface
      */
     private function trip(string $exchange, string $reason): void
     {
@@ -133,10 +139,13 @@ class TradingCircuitBreaker
         $this->cache->get($stateKey, fn() => $state);
     }
 
+    /**
+     * @throws TransportExceptionInterface
+     */
     private function notify(string $message): void
     {
-        $notification = (new Notification($message, ['chat/telegram', 'sms']));
-        // Sends instantly via configured Symfony Notifier bridges
-         $this->notifier->send($notification);
+        $sms = new SmsMessage(phone: $this->adminPhoneNumber, subject: $message);
+
+        $this->texter->send($sms);
     }
 }

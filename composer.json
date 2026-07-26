@@ -24,6 +24,7 @@
         "scheb/2fa-totp": "^8.6",
         "scheb/2fa-trusted-device": "^8.6",
         "stof/doctrine-extensions-bundle": "^1.15",
+        "symfony/amazon-sns-notifier": "8.1.*",
         "symfony/asset": "8.1.*",
         "symfony/asset-mapper": "8.1.*",
         "symfony/console": "8.1.*",

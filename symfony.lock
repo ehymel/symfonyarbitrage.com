@@ -81,6 +81,15 @@
             "./config/packages/stof_doctrine_extensions.yaml"
         ]
     },
+    "symfony/amazon-sns-notifier": {
+        "version": "8.1",
+        "recipe": {
+            "repo": "github.com/symfony/recipes",
+            "branch": "main",
+            "version": "5.4",
+            "ref": "c7b97b1deaaf9a99283aee58b13435d34de11d20"
+        }
+    },
     "symfony/asset-mapper": {
         "version": "8.1",
         "recipe": {

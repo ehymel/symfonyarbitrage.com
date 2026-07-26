@@ -42,6 +42,12 @@ class KrakenExchangeService
     public function executeMarketOrder(string $symbol, string $side, float $amount): array
     {
         // $side = 'buy' or 'sell'
-        return $this->exchange->create_order($symbol, 'market', $side, $amount);
+        $buyOrSell = match($side) {
+            'buy' => 'BUY',
+            'sell' => 'SELL',
+            default => throw new \InvalidArgumentException('Invalid side value'),
+        };
+
+        return $this->exchange->create_order($symbol, 'market', $buyOrSell, $amount);
     }
 }
