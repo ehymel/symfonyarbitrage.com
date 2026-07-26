@@ -12,6 +12,7 @@ use App\Service\ExchangeService\ExchangeServiceInterface;
 use App\Service\TradingCircuitBreaker;
 use Doctrine\ORM\EntityManagerInterface;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use Psr\Log\LogLevel;
@@ -19,6 +20,10 @@ use React\EventLoop\Loop;
 use React\Promise\Deferred;
 use React\Promise\PromiseInterface;
 use Symfony\Component\DependencyInjection\ServiceLocator;
+use Symfony\Component\Notifier\Message\MessageInterface;
+use Symfony\Component\Notifier\Message\SentMessage;
+use Symfony\Component\Notifier\Message\SmsMessage;
+use Symfony\Component\Notifier\TexterInterface;
 
 use function React\Promise\resolve;
 
@@ -44,11 +49,24 @@ final class ExecuteArbitrageHandlerTest extends TestCase
     private const float QUOTED_BUY = 100.0;
     private const float QUOTED_SELL = 110.0;
 
+    private const string ADMIN_PHONE = '+15555550123';
+
     private const array BUY_FILL = ['id' => 'BUY-9001', 'price' => 99.5];
     private const array SELL_FILL = ['id' => 'SELL-9002', 'price' => 110.25];
+    /** Flattening a long: sold back below what it cost. */
+    private const array UNWIND_SELL_FILL = ['id' => 'UNWIND-9003', 'price' => 98.0];
+
+    /** Flattening a short: bought back above what it sold for. */
+    private const array UNWIND_BUY_FILL = ['id' => 'UNWIND-9004', 'price' => 112.0];
 
     /** @var array<string, bool> venue name => breaker verdict */
     private array $allowed = [];
+
+    /** When set, isAllowed() returns false from this call onwards, whatever $allowed says. */
+    private ?int $allowedUntilCall = null;
+
+    /** When set, every circuit breaker call throws instead of recording. */
+    private ?\Throwable $breakerOutage = null;
 
     /** @var array<string, array|\Throwable|\Closure> keyed "venue:side" */
     private array $outcomes = [];
@@ -74,6 +92,9 @@ final class ExecuteArbitrageHandlerTest extends TestCase
     /** @var list<array{0: string, 1: string}> [venue, reason] */
     private array $failures = [];
 
+    /** @var list<array{0: string, 1: string}> [venue, reason] — outright trips, not counter increments */
+    private array $trips = [];
+
     /** @var list<array{0: string, 1: mixed}> [entityClass, id] */
     private array $references = [];
 
@@ -85,9 +106,18 @@ final class ExecuteArbitrageHandlerTest extends TestCase
     /** @var array<string, list<string>> messages captured per PSR-3 level */
     private array $loggedMessages = [];
 
+    /** @var list<SmsMessage> */
+    private array $sentMessages = [];
+
+    /** Set to have the SMS transport blow up, simulating a texting outage. */
+    private ?\Throwable $texterFailure = null;
+
     protected function setUp(): void
     {
         $this->allowed = [];
+        $this->allowedUntilCall = null;
+        $this->breakerOutage = null;
+        $this->trips = [];
         $this->outcomes = [];
         $this->delays = [];
         $this->venues = [];
@@ -100,6 +130,8 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         $this->persisted = [];
         $this->flushes = 0;
         $this->loggedMessages = [];
+        $this->sentMessages = [];
+        $this->texterFailure = null;
     }
 
     // ------------------------------------------------------- CIRCUIT BREAKER GATE
@@ -347,7 +379,12 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         self::assertSame([], $this->logMessages(LogLevel::EMERGENCY));
     }
 
-    public function testAnOrphanedBuyIsPersistedWithNoSellSideDetail(): void
+    /**
+     * The reversing order really is the sell side of what happened, so it belongs in the
+     * sell columns. Without it the row would show a filled buy, an empty sell and a null
+     * P&L — no trace that the money actually went out and came back.
+     */
+    public function testAnOrphanedBuyIsPersistedWithTheUnwindAsItsSellSide(): void
     {
         $this->partialBuy();
 
@@ -358,9 +395,49 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         self::assertSame('PARTIAL_BUY_UNWOUND', $execution->status);
         self::assertSame('BUY-9001', $execution->buyOrderId);
         self::assertSame('99.5', $execution->buyFilledPrice);
-        self::assertNull($execution->sellOrderId);
-        self::assertNull($execution->sellFilledPrice);
-        self::assertNull($execution->actualProfitUSD, 'a half-filled trade has no realised P&L to report');
+        self::assertSame('UNWIND-9003', $execution->sellOrderId);
+        self::assertSame('98', $execution->sellFilledPrice);
+    }
+
+    public function testTheRealisedLossOnAnUnwoundBuyIsRecorded(): void
+    {
+        $this->partialBuy();
+
+        $this->handle();
+
+        // Bought 2.0 at 99.5, sold the same 2.0 straight back at 98.0.
+        self::assertSame('-3.0000', $this->persistedExecution()->actualProfitUSD);
+    }
+
+    public function testAnUnwindReportingOnlyAnAveragePriceStillYieldsTheRealisedLoss(): void
+    {
+        $this->partialBuy();
+        $this->outcomes[self::BUY_VENUE . ':sell'] = ['id' => 'U', 'average' => 98.0];
+
+        $this->handle();
+
+        self::assertSame('-3.0000', $this->persistedExecution()->actualProfitUSD);
+    }
+
+    /**
+     * The quoted sell price belongs to the arbitrage leg that never executed. Falling back
+     * to it here would report a healthy profit on a position that was bought and dumped at
+     * a loss, so an unwind with no reported price leaves the P&L unknown instead.
+     */
+    public function testAnUnwindWithNoReportedPriceDoesNotInventAProfitFromTheQuote(): void
+    {
+        $this->partialBuy();
+        $this->outcomes[self::BUY_VENUE . ':sell'] = ['id' => 'U'];
+
+        $this->handle();
+
+        $execution = $this->persistedExecution();
+
+        self::assertSame('U', $execution->sellOrderId, 'the unwind itself is still recorded');
+        self::assertNull(
+            $execution->actualProfitUSD,
+            'the quote would have fabricated (110.00 - 99.50) * 2 = +21.00 on a losing unwind'
+        );
     }
 
     /**
@@ -383,28 +460,304 @@ final class ExecuteArbitrageHandlerTest extends TestCase
     }
 
     /**
-     * Documents a gap worth knowing about: the status is chosen before the unwind is
-     * attempted, so a row can read PARTIAL_BUY_UNWOUND while the position is still open.
-     * The emergency log above is the only signal that separates the two.
+     * The distinction the ledger exists to make. A flattened position and an open one are
+     * physically opposite outcomes and must never share a status — reading UNWOUND has to
+     * mean the money actually came back.
      */
-    public function testAFailedUnwindIsStillPersistedAsUnwound(): void
+    public function testAFailedUnwindIsPersistedAsStillOpenNotAsUnwound(): void
     {
         $this->partialBuy();
         $this->outcomes[self::BUY_VENUE . ':sell'] = new \RuntimeException('venue is down');
 
         $this->handle();
 
+        $execution = $this->persistedExecution();
+
+        self::assertSame('PARTIAL_BUY_UNWIND_FAILED', $execution->status);
+        self::assertSame('BUY-9001', $execution->buyOrderId, 'the leg that did fill is still recorded');
+        self::assertNull($execution->sellOrderId, 'nothing closed the position');
+        self::assertNull($execution->actualProfitUSD, 'the trade is still open, so there is no realised P&L');
+    }
+
+    public function testAFailedUnwindOnTheSellSideIsAlsoDistinguishable(): void
+    {
+        $this->partialSell();
+        $this->outcomes[self::SELL_VENUE . ':buy'] = new \RuntimeException('venue is down');
+
+        $this->handle();
+
+        self::assertSame('PARTIAL_SELL_UNWIND_FAILED', $this->persistedExecution()->status);
+    }
+
+    /**
+     * The status column is length: 30 and these are the longest values the handler emits.
+     * A truncated status would silently corrupt the one field that says whether the firm
+     * is carrying risk, so the check reads the value the handler actually produced.
+     */
+    #[DataProvider('unwindFailureProvider')]
+    public function testTheOpenPositionStatusFitsTheColumn(string $fixture, string $unwindLeg): void
+    {
+        $this->{$fixture}();
+        $this->outcomes[$unwindLeg] = new \RuntimeException('venue is down');
+
+        $this->handle();
+
+        self::assertLessThanOrEqual(30, strlen((string) $this->persistedExecution()->status));
+    }
+
+    public static function unwindFailureProvider(): iterable
+    {
+        yield 'buy side' => ['partialBuy', self::BUY_VENUE . ':sell'];
+        yield 'sell side' => ['partialSell', self::SELL_VENUE . ':buy'];
+    }
+
+    // ------------------------------------------------------------------- PAGING
+
+    public function testAFailedUnwindPagesTheAdminBySms(): void
+    {
+        $this->partialBuy();
+        $this->outcomes[self::BUY_VENUE . ':sell'] = new \RuntimeException('venue is down');
+
+        $this->handle();
+
+        self::assertCount(1, $this->sentMessages);
+        self::assertSame(self::ADMIN_PHONE, $this->sentMessages[0]->getPhone());
+        self::assertSame(
+            '🚨 UNWIND FAILED on coinbase! 2 ETH/USDT left OPEN (opportunity 4711). Manual intervention required!',
+            $this->sentMessages[0]->getSubject()
+        );
+    }
+
+    public function testThePageNamesTheVenueActuallyHoldingThePosition(): void
+    {
+        $this->partialSell();
+        $this->outcomes[self::SELL_VENUE . ':buy'] = new \RuntimeException('venue is down');
+
+        $this->handle();
+
+        self::assertCount(1, $this->sentMessages);
+        self::assertStringContainsString('UNWIND FAILED on kraken!', $this->sentMessages[0]->getSubject());
+    }
+
+    /**
+     * Everything else in the handler is a routine outcome. Paging on any of them would
+     * train the recipient to ignore the one message that means money is at risk.
+     */
+    #[DataProvider('nonPagingOutcomeProvider')]
+    public function testRoutineOutcomesDoNotPageAnyone(string $fixture): void
+    {
+        $this->{$fixture}();
+
+        $this->handle();
+
+        self::assertSame([], $this->sentMessages);
+    }
+
+    public static function nonPagingOutcomeProvider(): iterable
+    {
+        yield 'both legs filled' => ['fillBothLegs'];
+        yield 'partial buy, unwound successfully' => ['partialBuy'];
+        yield 'partial sell, unwound successfully' => ['partialSell'];
+        yield 'both legs failed' => ['bothLegsFail'];
+    }
+
+    /**
+     * The page is a courtesy on top of the ledger, not a precondition for it. If the SMS
+     * transport is down too, the row recording the open position still has to be written.
+     */
+    public function testASmsOutageDoesNotStopTheOpenPositionBeingRecorded(): void
+    {
+        $this->partialBuy();
+        $this->outcomes[self::BUY_VENUE . ':sell'] = new \RuntimeException('venue is down');
+        $this->texterFailure = new \RuntimeException('SNS unreachable');
+
+        $this->handle();
+
+        self::assertSame('PARTIAL_BUY_UNWIND_FAILED', $this->persistedExecution()->status);
+        self::assertSame(1, $this->flushes);
+        self::assertSame(
+            ['Failed to page admin about an open position: SNS unreachable'],
+            $this->logMessages(LogLevel::ERROR)
+        );
+    }
+
+    /**
+     * A venue that refuses a risk-reducing order is out of service on the spot — not
+     * incremented towards a threshold that would let the next trade through first. The
+     * leg failure is still a plain increment, and it belongs to the other venue: one
+     * incident, two venues, two different severities.
+     */
+    public function testAFailedUnwindTripsTheVenueThatRefusedItOutright(): void
+    {
+        $this->partialBuy();
+        $this->outcomes[self::BUY_VENUE . ':sell'] = new \RuntimeException('venue is down');
+
+        $this->handle();
+
+        self::assertSame([[self::BUY_VENUE, 'Unwind failed: venue is down']], $this->trips);
+        self::assertSame([[self::SELL_VENUE, 'SELL order failed: rejected']], $this->failures);
+    }
+
+    public function testASuccessfulUnwindLeavesTheVenueInService(): void
+    {
+        $this->partialBuy();
+
+        $this->handle();
+
+        self::assertSame([], $this->trips, 'the venue did what was asked of it');
+        self::assertSame([[self::SELL_VENUE, 'SELL order failed: rejected']], $this->failures);
+    }
+
+    public function testAFailedSellSideUnwindTripsTheSellVenue(): void
+    {
+        $this->partialSell();
+        $this->outcomes[self::SELL_VENUE . ':buy'] = new \RuntimeException('venue is down');
+
+        $this->handle();
+
+        self::assertSame([[self::SELL_VENUE, 'Unwind failed: venue is down']], $this->trips);
+        self::assertSame([[self::BUY_VENUE, 'BUY order failed: rejected']], $this->failures);
+    }
+
+    /**
+     * An outright trip is reserved for the refused unwind. Escalating routine outcomes
+     * the same way would take venues out of service for ordinary bad luck.
+     */
+    #[DataProvider('nonPagingOutcomeProvider')]
+    public function testRoutineOutcomesNeverTripAVenueOutright(string $fixture): void
+    {
+        $this->{$fixture}();
+
+        $this->handle();
+
+        self::assertSame([], $this->trips);
+    }
+
+    /**
+     * The exemption that makes charging the venue safe. If the unwind were gated, a venue
+     * tripped by this very incident could refuse the order that closes the position — the
+     * breaker would be causing the exposure it exists to limit.
+     */
+    public function testTheUnwindNeverConsultsTheCircuitBreaker(): void
+    {
+        $this->partialBuy();
+
+        $this->handle();
+
+        self::assertSame(
+            [self::BUY_VENUE, self::SELL_VENUE],
+            $this->gateChecks,
+            'the gate is for the two speculative legs only'
+        );
+    }
+
+    public function testAnUnwindStillRunsAfterTheVenueIsTrippedMidTrade(): void
+    {
+        // Allow the two entry checks, then slam the gate shut on everything — the state a
+        // venue lands in when the leg failure moments earlier tripped its breaker.
+        $this->allowedUntilCall = 2;
+        $this->partialBuy();
+
+        $this->handle();
+
+        self::assertSame(
+            ['coinbase:buy', 'kraken:sell', 'coinbase:sell'],
+            array_map(static fn(array $o): string => "{$o['venue']}:{$o['side']}", $this->orders),
+            'the position was still flattened'
+        );
         self::assertSame('PARTIAL_BUY_UNWOUND', $this->persistedExecution()->status);
     }
 
-    public function testTheUnwindItselfIsNotChargedToTheBreaker(): void
+    // ----------------------------------------------------------- BREAKER OUTAGE
+
+    /**
+     * The breaker is bookkeeping and must never outrank the trade. Every one of its
+     * methods touches the cache and can reach the SMS transport, so all of them can throw
+     * at exactly the moment things are already going wrong — and an exception escaping
+     * here would abort the handler before the ledger row that records what happened.
+     */
+    public function testABreakerOutageDoesNotStopTheOpenPositionBeingRecorded(): void
     {
         $this->partialBuy();
         $this->outcomes[self::BUY_VENUE . ':sell'] = new \RuntimeException('venue is down');
+        $this->breakerOutage = new \RuntimeException('cache unreachable');
 
         $this->handle();
 
-        self::assertSame([[self::SELL_VENUE, 'SELL order failed: rejected']], $this->failures);
+        self::assertSame('PARTIAL_BUY_UNWIND_FAILED', $this->persistedExecution()->status);
+        self::assertSame(1, $this->flushes);
+        self::assertCount(1, $this->sentMessages, 'the admin was still paged');
+    }
+
+    /**
+     * The dangerous one, because it runs *before* the unwind. An exception from the leg
+     * failure report used to abort the handler mid-incident: no unwind, no page, no row —
+     * a cache blip silently converting a partial fill into an orphaned position.
+     */
+    public function testABreakerOutageStillLetsThePositionBeUnwound(): void
+    {
+        $this->partialBuy();
+        $this->breakerOutage = new \RuntimeException('cache unreachable');
+
+        $this->handle();
+
+        self::assertSame(
+            ['coinbase:buy', 'kraken:sell', 'coinbase:sell'],
+            array_map(static fn(array $o): string => "{$o['venue']}:{$o['side']}", $this->orders),
+            'the unwind must still run'
+        );
+        self::assertSame('PARTIAL_BUY_UNWOUND', $this->persistedExecution()->status);
+        self::assertSame(
+            ['Circuit breaker update failed while recording failure for kraken: cache unreachable'],
+            $this->logMessages(LogLevel::ERROR)
+        );
+    }
+
+    /**
+     * Worst case for a lost row: money actually moved on both venues. Without a record
+     * there is nothing to reconcile against.
+     */
+    public function testABreakerOutageDoesNotStopACompletedTradeBeingRecorded(): void
+    {
+        $this->fillBothLegs();
+        $this->breakerOutage = new \RuntimeException('cache unreachable');
+
+        $this->handle();
+
+        $execution = $this->persistedExecution();
+
+        self::assertSame('COMPLETED', $execution->status);
+        self::assertSame('21.5000', $execution->actualProfitUSD);
+        self::assertSame([
+            'Circuit breaker update failed while recording success for coinbase: cache unreachable',
+            'Circuit breaker update failed while recording success for kraken: cache unreachable',
+        ], $this->logMessages(LogLevel::ERROR), 'both legs are reported independently');
+    }
+
+    public function testABreakerOutageDoesNotStopAFailedTradeBeingRecorded(): void
+    {
+        $this->bothLegsFail();
+        $this->breakerOutage = new \RuntimeException('cache unreachable');
+
+        $this->handle();
+
+        self::assertSame('FAILED', $this->persistedExecution()->status);
+        self::assertCount(2, $this->logMessages(LogLevel::ERROR));
+    }
+
+    /**
+     * A degraded breaker is an infrastructure problem, not a position at risk. Paging on
+     * it would flood the on-call the moment the cache wobbles, drowning out the one
+     * message that means money is exposed.
+     */
+    public function testABreakerOutageAloneDoesNotPageAnyone(): void
+    {
+        $this->partialBuy();
+        $this->breakerOutage = new \RuntimeException('cache unreachable');
+
+        $this->handle();
+
+        self::assertSame([], $this->sentMessages);
     }
 
     // -------------------------------------------- PARTIAL FILL: SELL LANDED, BUY DIED
@@ -432,7 +785,7 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         ], $this->orders, 'a short is closed by buying it back on the venue that is short');
     }
 
-    public function testAnOrphanedSellIsPersistedWithNoBuySideDetail(): void
+    public function testAnOrphanedSellIsPersistedWithTheUnwindAsItsBuySide(): void
     {
         $this->partialSell();
 
@@ -443,9 +796,18 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         self::assertSame('PARTIAL_SELL_UNWOUND', $execution->status);
         self::assertSame('SELL-9002', $execution->sellOrderId);
         self::assertSame('110.25', $execution->sellFilledPrice);
-        self::assertNull($execution->buyOrderId);
-        self::assertNull($execution->buyFilledPrice);
-        self::assertNull($execution->actualProfitUSD);
+        self::assertSame('UNWIND-9004', $execution->buyOrderId);
+        self::assertSame('112', $execution->buyFilledPrice);
+    }
+
+    public function testTheRealisedLossOnAnUnwoundSellIsRecorded(): void
+    {
+        $this->partialSell();
+
+        $this->handle();
+
+        // Sold 2.0 at 110.25, bought the same 2.0 straight back at 112.0.
+        self::assertSame('-3.5000', $this->persistedExecution()->actualProfitUSD);
     }
 
     public function testTheOrphanedSellUnwindNamesTheCorrectVenue(): void
@@ -708,6 +1070,8 @@ final class ExecuteArbitrageHandlerTest extends TestCase
             $this->circuitBreaker(),
             $this->entityManager(),
             $this->recordingLogger(),
+            $this->recordingTexter(),
+            self::ADMIN_PHONE,
         );
 
         $handler(new ExecuteArbitrageMessage(
@@ -727,11 +1091,18 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         $this->outcomes[self::SELL_VENUE . ':sell'] = self::SELL_FILL;
     }
 
+    private function bothLegsFail(): void
+    {
+        $this->outcomes[self::BUY_VENUE . ':buy'] = new \RuntimeException('buy timed out');
+        $this->outcomes[self::SELL_VENUE . ':sell'] = new \RuntimeException('sell timed out');
+    }
+
     /** Buy leg lands, sell leg dies — the position is long and needs flattening. */
     private function partialBuy(string $reason = 'rejected'): void
     {
         $this->outcomes[self::BUY_VENUE . ':buy'] = self::BUY_FILL;
         $this->outcomes[self::SELL_VENUE . ':sell'] = new \RuntimeException($reason);
+        $this->outcomes[self::BUY_VENUE . ':sell'] = self::UNWIND_SELL_FILL;
     }
 
     /** Sell leg lands, buy leg dies — the position is short and needs flattening. */
@@ -739,6 +1110,7 @@ final class ExecuteArbitrageHandlerTest extends TestCase
     {
         $this->outcomes[self::BUY_VENUE . ':buy'] = new \RuntimeException($reason);
         $this->outcomes[self::SELL_VENUE . ':sell'] = self::SELL_FILL;
+        $this->outcomes[self::SELL_VENUE . ':buy'] = self::UNWIND_BUY_FILL;
     }
 
     private function exchangeFactory(): ExchangeFactory
@@ -853,21 +1225,43 @@ final class ExecuteArbitrageHandlerTest extends TestCase
             function (string $exchange): bool {
                 $this->gateChecks[] = $exchange;
 
+                if ($this->allowedUntilCall !== null && count($this->gateChecks) > $this->allowedUntilCall) {
+                    return false;
+                }
+
                 return $this->allowed[$exchange] ?? true;
             }
         );
         $breaker->method('recordSuccess')->willReturnCallback(
             function (string $exchange, int $executionTimeMs): void {
+                $this->failIfBreakerIsOut();
+
                 $this->successes[] = [$exchange, $executionTimeMs];
             }
         );
         $breaker->method('recordFailure')->willReturnCallback(
             function (string $exchange, string $reason): void {
+                $this->failIfBreakerIsOut();
+
                 $this->failures[] = [$exchange, $reason];
+            }
+        );
+        $breaker->method('tripImmediately')->willReturnCallback(
+            function (string $exchange, string $reason): void {
+                $this->failIfBreakerIsOut();
+
+                $this->trips[] = [$exchange, $reason];
             }
         );
 
         return $breaker;
+    }
+
+    private function failIfBreakerIsOut(): void
+    {
+        if ($this->breakerOutage !== null) {
+            throw $this->breakerOutage;
+        }
     }
 
     private function entityManager(): EntityManagerInterface
@@ -907,11 +1301,31 @@ final class ExecuteArbitrageHandlerTest extends TestCase
      * Stubbing each level separately pins *which* severity every event is reported
      * at — a routed-through log() double would let a downgrade from emergency slip by.
      */
+    private function recordingTexter(): TexterInterface
+    {
+        $texter = $this->createStub(TexterInterface::class);
+
+        $texter->method('supports')->willReturn(true);
+        $texter->method('send')->willReturnCallback(
+            function (MessageInterface $message): ?SentMessage {
+                if ($this->texterFailure !== null) {
+                    throw $this->texterFailure;
+                }
+
+                $this->sentMessages[] = $message;
+
+                return null;
+            }
+        );
+
+        return $texter;
+    }
+
     private function recordingLogger(): LoggerInterface
     {
         $logger = $this->createStub(LoggerInterface::class);
 
-        foreach ([LogLevel::WARNING, LogLevel::CRITICAL, LogLevel::EMERGENCY, LogLevel::INFO] as $level) {
+        foreach ([LogLevel::WARNING, LogLevel::CRITICAL, LogLevel::EMERGENCY, LogLevel::INFO, LogLevel::ERROR] as $level) {
             $logger->method($level)->willReturnCallback(
                 function (string|\Stringable $message) use ($level): void {
                     $this->loggedMessages[$level][] = (string) $message;

@@ -305,6 +305,102 @@ final class TradingCircuitBreakerTest extends TestCase
         self::assertFalse($breaker->isAllowed(self::EXCHANGE));
     }
 
+    // ------------------------------------------------------- IMMEDIATE TRIPS
+
+    /**
+     * The escalation path for events where the threshold is the wrong instrument: one
+     * refused emergency order is already one too many, and waiting for a second would
+     * mean admitting another trade to a venue that has proven it cannot be trusted.
+     */
+    public function testAnImmediateTripOpensTheCircuitOnTheFirstCall(): void
+    {
+        $breaker = $this->breaker();
+
+        $breaker->tripImmediately(self::EXCHANGE, 'Unwind failed: venue is down');
+
+        self::assertSame('OPEN', $this->state(self::EXCHANGE));
+        self::assertFalse($breaker->isAllowed(self::EXCHANGE));
+    }
+
+    public function testAnImmediateTripIgnoresTheFailureThreshold(): void
+    {
+        $breaker = $this->breaker(maxFailures: 99);
+
+        $breaker->tripImmediately(self::EXCHANGE, 'Unwind failed: venue is down');
+
+        self::assertFalse($breaker->isAllowed(self::EXCHANGE), 'the threshold must not apply');
+    }
+
+    public function testAnImmediateTripAnnouncesItselfLikeAnyOtherTrip(): void
+    {
+        $breaker = $this->breaker();
+
+        $breaker->tripImmediately(self::EXCHANGE, 'Unwind failed: venue is down');
+
+        self::assertCount(1, $this->sentMessages);
+        self::assertSame(
+            '🚨 CIRCUIT BREAKER TRIPPED on binance! Reason: Unwind failed: venue is down. Trading paused for 300s.',
+            $this->sentMessages[0]->getSubject()
+        );
+        self::assertSame([$this->sentMessages[0]->getSubject()], $this->logMessages(LogLevel::CRITICAL));
+    }
+
+    public function testAnImmediateTripServesTheNormalCooldown(): void
+    {
+        $breaker = $this->breaker();
+        $breaker->tripImmediately(self::EXCHANGE, 'Unwind failed: venue is down');
+
+        $this->backdateOpenedAt(self::EXCHANGE, self::COOLDOWN_SECONDS + 1);
+
+        self::assertTrue($breaker->isAllowed(self::EXCHANGE), 'a probe is allowed once the cooldown elapses');
+        self::assertSame('HALF_OPEN', $this->state(self::EXCHANGE));
+    }
+
+    /**
+     * The reason the counter is forced rather than left alone. A trip that skipped it
+     * would leave a count of 0, so the first failed probe after the cooldown would reach
+     * only 1, fall short of maxFailures, and strand the venue HALF_OPEN — silently
+     * readmitting trades to somewhere that has already failed twice over.
+     */
+    public function testAFailedProbeAfterAnImmediateTripReopensTheCircuit(): void
+    {
+        $breaker = $this->breaker();
+        $breaker->tripImmediately(self::EXCHANGE, 'Unwind failed: venue is down');
+        $this->backdateOpenedAt(self::EXCHANGE, self::COOLDOWN_SECONDS + 1);
+        $breaker->isAllowed(self::EXCHANGE);
+
+        self::assertSame('HALF_OPEN', $this->state(self::EXCHANGE), 'fixture precondition');
+
+        $breaker->recordFailure(self::EXCHANGE, 'still broken');
+
+        self::assertSame('OPEN', $this->state(self::EXCHANGE));
+        self::assertFalse($breaker->isAllowed(self::EXCHANGE));
+    }
+
+    public function testASuccessfulProbeAfterAnImmediateTripStillRecovers(): void
+    {
+        $breaker = $this->breaker();
+        $breaker->tripImmediately(self::EXCHANGE, 'Unwind failed: venue is down');
+        $this->backdateOpenedAt(self::EXCHANGE, self::COOLDOWN_SECONDS + 1);
+        $breaker->isAllowed(self::EXCHANGE);
+
+        $breaker->recordSuccess(self::EXCHANGE, 100);
+
+        self::assertSame('CLOSED', $this->state(self::EXCHANGE));
+        self::assertNull($this->cached(sprintf('cb_%s_failures', self::EXCHANGE)), 'the forced count is cleared too');
+    }
+
+    public function testAnImmediateTripOnlyAffectsItsOwnVenue(): void
+    {
+        $breaker = $this->breaker();
+
+        $breaker->tripImmediately('binance', 'Unwind failed: venue is down');
+
+        self::assertFalse($breaker->isAllowed('binance'));
+        self::assertTrue($breaker->isAllowed('kraken'));
+        self::assertNull($this->cached('cb_kraken_failures'));
+    }
+
     // -------------------------------------------------------------- ISOLATION
 
     public function testCircuitsAreTrackedPerExchange(): void

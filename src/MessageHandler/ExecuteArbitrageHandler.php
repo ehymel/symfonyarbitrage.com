@@ -13,8 +13,11 @@ use Doctrine\ORM\Exception\ORMException;
 use Psr\Cache\InvalidArgumentException;
 use Psr\Log\LoggerInterface;
 use React\Promise\PromiseInterface;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use Symfony\Component\Messenger\Attribute\AsMessageHandler;
 use Symfony\Component\Notifier\Exception\TransportExceptionInterface;
+use Symfony\Component\Notifier\Message\SmsMessage;
+use Symfony\Component\Notifier\TexterInterface;
 
 use function React\Async\await;
 use function React\Promise\all;
@@ -26,7 +29,9 @@ readonly class ExecuteArbitrageHandler
         private ExchangeFactory        $exchangeFactory,
         private TradingCircuitBreaker  $circuitBreaker,
         private EntityManagerInterface $em,
-        private LoggerInterface        $logger
+        private LoggerInterface        $logger,
+        private TexterInterface        $texter,
+        #[Autowire(env: 'ADMIN_PHONE_NUMBER')] private string $adminPhoneNumber,
     ) {}
 
     /**
@@ -87,33 +92,48 @@ readonly class ExecuteArbitrageHandler
         // 4. HANDLE EXECUTION OUTCOMES & RISK UNWINDING
         if (count($results) === 2) {
             // SUCCESS: Both orders executed simultaneously
-            $this->circuitBreaker->recordSuccess($buyExchangeName, $executionTimeMs);
-            $this->circuitBreaker->recordSuccess($sellExchangeName, $executionTimeMs);
+            $this->reportSuccess($buyExchangeName, $executionTimeMs);
+            $this->reportSuccess($sellExchangeName, $executionTimeMs);
 
             $this->logExecutionToRds($message, $results['buy'], $results['sell'], 'COMPLETED', $executionTimeMs);
 
         } elseif (isset($results['buy']) && isset($errors['sell'])) {
             // CRITICAL RISK: Partial Fill! BUY filled, but SELL failed.
-            $this->circuitBreaker->recordFailure($sellExchangeName, "SELL order failed: " . $errors['sell']->getMessage());
+            $this->reportFailure($sellExchangeName, "SELL order failed: " . $errors['sell']->getMessage());
 
             $this->logger->critical("PARTIAL FILL DETECTED! Unwinding position on {$buyExchangeName}...");
-            $this->unwindPosition($buyExchange, $message->getSymbol(), 'sell', $message->getAmount());
+            $unwind = $this->unwindPosition($buyExchange, $buyExchangeName, 'sell', $message);
 
-            $this->logExecutionToRds($message, $results['buy'], null, 'PARTIAL_BUY_UNWOUND', $executionTimeMs);
+            // The reversing order is the sell side of what actually happened, so it goes in
+            // the sell slot: the row then carries the realised loss on the round trip rather
+            // than an empty leg and a null P&L.
+            $this->logExecutionToRds(
+                $message,
+                $results['buy'],
+                $unwind,
+                $unwind === null ? 'PARTIAL_BUY_UNWIND_FAILED' : 'PARTIAL_BUY_UNWOUND',
+                $executionTimeMs
+            );
 
         } elseif (isset($results['sell']) && isset($errors['buy'])) {
             // CRITICAL RISK: Partial Fill! SELL filled, but BUY failed.
-            $this->circuitBreaker->recordFailure($buyExchangeName, "BUY order failed: " . $errors['buy']->getMessage());
+            $this->reportFailure($buyExchangeName, "BUY order failed: " . $errors['buy']->getMessage());
 
             $this->logger->critical("PARTIAL FILL DETECTED! Unwinding position on {$sellExchangeName}...");
-            $this->unwindPosition($sellExchange, $message->getSymbol(), 'buy', $message->getAmount());
+            $unwind = $this->unwindPosition($sellExchange, $sellExchangeName, 'buy', $message);
 
-            $this->logExecutionToRds($message, null, $results['sell'], 'PARTIAL_SELL_UNWOUND', $executionTimeMs);
+            $this->logExecutionToRds(
+                $message,
+                $unwind,
+                $results['sell'],
+                $unwind === null ? 'PARTIAL_SELL_UNWIND_FAILED' : 'PARTIAL_SELL_UNWOUND',
+                $executionTimeMs
+            );
 
         } else {
             // TOTAL FAILURE: Both orders failed
-            $this->circuitBreaker->recordFailure($buyExchangeName, $errors['buy']->getMessage());
-            $this->circuitBreaker->recordFailure($sellExchangeName, $errors['sell']->getMessage());
+            $this->reportFailure($buyExchangeName, $errors['buy']->getMessage());
+            $this->reportFailure($sellExchangeName, $errors['sell']->getMessage());
 
             $this->logExecutionToRds($message, null, null, 'FAILED', $executionTimeMs);
         }
@@ -140,14 +160,121 @@ readonly class ExecuteArbitrageHandler
 
     /**
      * Emergency Unwind: Immediately market-reverses an orphaned trade to flatten position.
+     *
+     * Returning the reversing order rather than nothing is what lets the caller tell a
+     * flattened position from an open one — the two used to be indistinguishable in the
+     * ledger — and gives it the fill needed to record the realised loss.
+     *
+     * Deliberately does NOT consult the circuit breaker. An unwind reduces risk rather
+     * than taking it, and the venue holding the position may well have just been tripped
+     * by the same incident that created it — on a same-venue trade, by the leg failure a
+     * few lines above. Gating this call could strand an open position behind a cooldown,
+     * which is the opposite of what the breaker is for.
+     *
+     * @return array|null the reversing order, or null if the position is STILL OPEN
      */
-    private function unwindPosition(ExchangeServiceInterface $exchange, string $symbol, string $side, float $amount): void
-    {
+    private function unwindPosition(
+        ExchangeServiceInterface $exchange,
+        string $venue,
+        string $side,
+        ExecuteArbitrageMessage $message,
+    ): ?array {
         try {
-            $exchange->executeMarketOrder($symbol, $side, $amount);
+            $order = $exchange->executeMarketOrder($message->getSymbol(), $side, $message->getAmount());
             $this->logger->info("Position successfully unwound via market {$side}.");
+
+            return $order;
         } catch (\Throwable $e) {
             $this->logger->emergency("CRITICAL FAILURE: Emergency unwind failed! Manual intervention required! Error: " . $e->getMessage());
+
+            // Worst outcome in the system: an unhedged position nobody is watching. A log
+            // line alone leaves it sitting until someone reads a mailbox, so page the admin
+            // on the same channel the circuit breaker already uses.
+            //
+            // Order matters. The human is raised first, then the venue is stopped, and each
+            // step is isolated so a failure in either cannot prevent the ledger row that
+            // records the open position — that row is the last thing standing between an
+            // orphaned trade and nobody ever knowing about it.
+            $this->pageAdmin(sprintf(
+                '🚨 UNWIND FAILED on %s! %s %s left OPEN (opportunity %s). Manual intervention required!',
+                $venue,
+                $message->getAmount(),
+                $message->getSymbol(),
+                $message->getOpportunityId()
+            ));
+
+            $this->quarantineVenue($venue, $e);
+
+            return null;
+        }
+    }
+
+    private function reportSuccess(string $venue, int $executionTimeMs): void
+    {
+        $this->guardBreaker(
+            fn() => $this->circuitBreaker->recordSuccess($venue, $executionTimeMs),
+            "recording success for {$venue}"
+        );
+    }
+
+    private function reportFailure(string $venue, string $reason): void
+    {
+        $this->guardBreaker(
+            fn() => $this->circuitBreaker->recordFailure($venue, $reason),
+            "recording failure for {$venue}"
+        );
+    }
+
+    /**
+     * The breaker is bookkeeping, and bookkeeping must never outrank the trade.
+     *
+     * Every one of its methods touches the cache, and any of them can reach the SMS
+     * transport when a circuit trips or recovers — so all of them can throw at precisely
+     * the moment things are already going wrong. Unguarded, a cache blip during a partial
+     * fill would abort this handler before the unwind ran and before the ledger row was
+     * written, turning a recoverable incident into an orphaned position nobody knows
+     * about. A degraded breaker is a problem; losing the trade record is a worse one.
+     */
+    private function guardBreaker(callable $update, string $context): void
+    {
+        try {
+            $update();
+        } catch (\Throwable $e) {
+            $this->logger->error("Circuit breaker update failed while {$context}: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Takes the venue out of service immediately after it refused an emergency order.
+     * Somewhere that will not accept a risk-reducing order has no business receiving
+     * risk-taking ones, and one such refusal is already one too many — hence an outright
+     * trip rather than a counter increment that would let the next trade through.
+     *
+     * Only failure is reported. A successful unwind says nothing about the venue's health
+     * and recording one would reset the counter the leg failure just incremented.
+     *
+     * Guarded like every other breaker call — see guardBreaker().
+     */
+    private function quarantineVenue(string $venue, \Throwable $cause): void
+    {
+        $this->guardBreaker(
+            fn() => $this->circuitBreaker->tripImmediately($venue, 'Unwind failed: ' . $cause->getMessage()),
+            "tripping {$venue} after a refused unwind"
+        );
+    }
+
+    /**
+     * Sends an SMS to the on-call admin.
+     *
+     * Transport failures are swallowed on purpose: this only runs when a position is
+     * already open, and an SMS outage must not stop the ledger row that records it.
+     */
+    private function pageAdmin(string $message): void
+    {
+        try {
+            $this->texter->send(new SmsMessage(phone: $this->adminPhoneNumber, subject: $message));
+        } catch (\Throwable $e) {
+            $this->logger->error('Failed to page admin about an open position: ' . $e->getMessage());
         }
     }
 
@@ -165,12 +292,28 @@ readonly class ExecuteArbitrageHandler
         // 1. Fetch reference to parent opportunity
         $opportunity = $this->em->getReference(ArbitrageOpportunity::class, $msg->getOpportunityId());
 
-        // 2. Calculate actual realized profit if both filled
+        // 2. Calculate actual realized profit if both legs produced a fill
         $actualProfitUsd = null;
         if ($buyResult && $sellResult) {
-            $buyFilled = (float) ($buyResult['price'] ?? $buyResult['average'] ?? $msg->getBuyPrice());
-            $sellFilled = (float) ($sellResult['price'] ?? $sellResult['average'] ?? $msg->getSellPrice());
-            $actualProfitUsd = number_format(($sellFilled - $buyFilled) * $msg->getAmount(), 4, '.', '');
+            // The quote is only a legitimate fallback for a trade that executed as quoted.
+            // On an unwound partial fill one of these legs is the reversing order, which the
+            // quote never described — falling back to it there would turn a realised loss
+            // into a fabricated profit, so leave the P&L unknown instead.
+            $quotedFallbackApplies = $status === 'COMPLETED';
+
+            $buyFilled = $buyResult['price'] ?? $buyResult['average']
+                ?? ($quotedFallbackApplies ? $msg->getBuyPrice() : null);
+            $sellFilled = $sellResult['price'] ?? $sellResult['average']
+                ?? ($quotedFallbackApplies ? $msg->getSellPrice() : null);
+
+            if ($buyFilled !== null && $sellFilled !== null) {
+                $actualProfitUsd = number_format(
+                    ((float) $sellFilled - (float) $buyFilled) * $msg->getAmount(),
+                    4,
+                    '.',
+                    ''
+                );
+            }
         }
 
         // 3. Populate TradeExecution matching RDS schema

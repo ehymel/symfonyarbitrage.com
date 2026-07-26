@@ -102,6 +102,28 @@ class TradingCircuitBreaker
     }
 
     /**
+     * Opens the circuit at once, without waiting for the failure threshold.
+     *
+     * For events severe enough that one is already too many — a venue refusing an
+     * emergency unwind, say. Letting it take another speculative trade while a counter
+     * catches up is not a risk worth running.
+     *
+     * @throws InvalidArgumentException|TransportExceptionInterface
+     */
+    public function tripImmediately(string $exchange, string $reason): void
+    {
+        // The counter is forced to the threshold as well as the circuit being opened.
+        // Without this, a failed probe after the cooldown would find a count of 1, fall
+        // short of maxFailures, and leave the venue HALF_OPEN — quietly readmitting
+        // trades to somewhere that has already proven it cannot be trusted.
+        $failKey = sprintf('cb_%s_failures', $exchange);
+        $this->cache->delete($failKey);
+        $this->cache->get($failKey, fn() => $this->maxFailures);
+
+        $this->trip($exchange, $reason);
+    }
+
+    /**
      * @throws InvalidArgumentException|TransportExceptionInterface
      */
     private function trip(string $exchange, string $reason): void

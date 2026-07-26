@@ -78,7 +78,7 @@ when@prod:
                 formatter: monolog.formatter.json
 
             # --- SMS Configuration ---
-#
+## don't implement this as it would break handling in ExecuteArbitrageHandler
 #            sms_deduplicated:
 #                type: deduplication
 #                handler: custom_sms_service

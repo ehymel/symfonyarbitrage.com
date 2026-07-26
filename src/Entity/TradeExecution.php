@@ -31,8 +31,11 @@ class TradeExecution
     #[ORM\Column(type: Types::DECIMAL, precision: 10, scale: 4, nullable: true)]
     public ?string $actualProfitUSD = null;
 
+    // COMPLETED, FAILED,
+    // PARTIAL_BUY_UNWOUND / PARTIAL_SELL_UNWOUND             — one leg filled, position flattened
+    // PARTIAL_BUY_UNWIND_FAILED / PARTIAL_SELL_UNWIND_FAILED — one leg filled, POSITION STILL OPEN
     #[ORM\Column(length: 30)]
-    public ?string $status = null;  // COMPLETED, PARTIAL_BUY_UNWOUND, PARTIAL_SELL_UNWOUND, FAILED
+    public ?string $status = null;
 
     #[ORM\Column]
     public ?int $executionTimeMs;
