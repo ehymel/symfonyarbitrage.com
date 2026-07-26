@@ -10,12 +10,14 @@ use App\Service\ExchangeService\ExchangeServiceInterface;
 use App\Service\TradingCircuitBreaker;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Exception\ORMException;
-use GuzzleHttp\Promise\Promise;
-use GuzzleHttp\Promise\Utils;
 use Psr\Cache\InvalidArgumentException;
 use Psr\Log\LoggerInterface;
+use React\Promise\PromiseInterface;
 use Symfony\Component\Messenger\Attribute\AsMessageHandler;
 use Symfony\Component\Notifier\Exception\TransportExceptionInterface;
+
+use function React\Async\await;
+use function React\Promise\all;
 
 #[AsMessageHandler]
 readonly class ExecuteArbitrageHandler
@@ -44,50 +46,33 @@ readonly class ExecuteArbitrageHandler
         $buyExchange = $this->exchangeFactory->create($buyExchangeName);
         $sellExchange = $this->exchangeFactory->create($sellExchangeName);
 
-        // 2. PREPARE PARALLEL PROMISES
-        // We wrap synchronous CCXT execution into Guzzle async promises
-        // to force cURL multi-exec to send HTTP POST requests concurrently over the wire.
+        // 2. DISPATCH BOTH LEGS OVER THE NETWORK
+        // ccxt's async client returns an already-running promise driven by a
+        // non-blocking React HTTP browser, so the SELL request goes on the wire while
+        // the BUY is still awaiting its response — genuinely concurrent, not interleaved
+        // bookkeeping around two blocking calls.
         $startTime = microtime(true);
 
-        $buyPromise = new Promise(function () use (&$buyPromise, $buyExchange, $message) {
-            try {
-                // Execute Market BUY on Exchange A
-                $order = $buyExchange->executeMarketOrder(
-                    $message->getSymbol(),
-                    'buy',
-                    $message->getAmount()
-                );
-                $buyPromise->resolve($order);
-            } catch (\Throwable $e) {
-                $buyPromise->reject($e);
-            }
-        });
-
-        $sellPromise = new Promise(function () use (&$sellPromise, $sellExchange, $message) {
-            try {
-                // Execute Market SELL on Exchange B
-                $order = $sellExchange->executeMarketOrder(
-                    $message->getSymbol(),
-                    'sell',
-                    $message->getAmount()
-                );
-                $sellPromise->resolve($order);
-            } catch (\Throwable $e) {
-                $sellPromise->reject($e);
-            }
-        });
-
-        // 3. EXECUTE SIMULTANEOUSLY OVER NETWORK
         $promises = [
-            'buy' => $buyPromise,
-            'sell' => $sellPromise,
+            'buy' => $this->settle($buyExchange->executeMarketOrderAsync(
+                $message->getSymbol(),
+                'buy',
+                $message->getAmount()
+            )),
+            'sell' => $this->settle($sellExchange->executeMarketOrderAsync(
+                $message->getSymbol(),
+                'sell',
+                $message->getAmount()
+            )),
         ];
 
         $results = [];
         $errors = [];
 
-        // Settlement pool: Wait for both HTTP calls to complete or fail
-        $settled = Utils::settle($promises)->wait();
+        // 3. WAIT FOR BOTH TO SETTLE
+        // Both legs are already in flight; this just runs the event loop until each has
+        // an outcome. Neither leg can be abandoned while its order is still live.
+        $settled = await(all($promises));
 
         foreach ($settled as $key => $result) {
             if ($result['state'] === 'fulfilled') {
@@ -132,6 +117,25 @@ readonly class ExecuteArbitrageHandler
 
             $this->logExecutionToRds($message, null, null, 'FAILED', $executionTimeMs);
         }
+    }
+
+    /**
+     * Converts a leg into a promise that always fulfils, carrying its outcome.
+     *
+     * React's all() rejects the moment any input rejects, which here would mean
+     * returning while the other leg's order is still live on the venue — leaving a
+     * position nobody knows about. Settling first means a failed leg can never
+     * abandon its partner.
+     *
+     * @param PromiseInterface<array> $leg
+     * @return PromiseInterface<array{state: string, value?: array, reason?: \Throwable}>
+     */
+    private function settle(PromiseInterface $leg): PromiseInterface
+    {
+        return $leg->then(
+            static fn (array $order): array => ['state' => 'fulfilled', 'value' => $order],
+            static fn (\Throwable $e): array => ['state' => 'rejected', 'reason' => $e],
+        );
     }
 
     /**

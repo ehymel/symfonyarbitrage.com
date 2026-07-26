@@ -22,7 +22,7 @@ class TradingCircuitBreaker
         private LoggerInterface $logger,
         #[Autowire(env: 'ADMIN_PHONE_NUMBER')] private string $adminPhoneNumber,
         private int $maxFailures = 2,
-        private int $maxLatencyMs = 450,
+        private int $maxLatencyMs = 450,    // may need to be adjusted after making buy/sell orders truly concurrent in ExecuteArbitrageHandler
         private int $cooldownSeconds = 300, // 5-minute pause
     ) {}
 

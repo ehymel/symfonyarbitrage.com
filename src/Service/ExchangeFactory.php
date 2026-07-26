@@ -3,14 +3,14 @@
 namespace App\Service;
 
 use App\Service\ExchangeService\ExchangeServiceInterface;
-use Psr\Container\ContainerInterface;
 use Symfony\Component\DependencyInjection\Attribute\AutowireLocator;
+use Symfony\Contracts\Service\ServiceProviderInterface;
 
 class ExchangeFactory
 {
     public function __construct(
         #[AutowireLocator(ExchangeServiceInterface::class)]
-        private readonly ContainerInterface $exchanges
+        private readonly ServiceProviderInterface $exchanges
     ) {
     }
 
@@ -23,5 +23,15 @@ class ExchangeFactory
         }
 
         return $this->exchanges->get($key);
+    }
+
+    /**
+     * Every venue wired into the locator, by tag index.
+     *
+     * @return list<string>
+     */
+    public function names(): array
+    {
+        return array_keys($this->exchanges->getProvidedServices());
     }
 }

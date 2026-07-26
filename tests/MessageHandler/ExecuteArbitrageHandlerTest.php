@@ -15,7 +15,12 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use Psr\Log\LogLevel;
+use React\EventLoop\Loop;
+use React\Promise\Deferred;
+use React\Promise\PromiseInterface;
 use Symfony\Component\DependencyInjection\ServiceLocator;
+
+use function React\Promise\resolve;
 
 /**
  * The handler is a risk machine: it decides what gets sent to a venue, what gets
@@ -47,6 +52,9 @@ final class ExecuteArbitrageHandlerTest extends TestCase
 
     /** @var array<string, array|\Throwable|\Closure> keyed "venue:side" */
     private array $outcomes = [];
+
+    /** @var array<string, float> keyed "venue:side" — seconds on the loop before the leg settles */
+    private array $delays = [];
 
     /** @var array<string, ExchangeServiceInterface> memoised venue stubs */
     private array $venues = [];
@@ -81,6 +89,7 @@ final class ExecuteArbitrageHandlerTest extends TestCase
     {
         $this->allowed = [];
         $this->outcomes = [];
+        $this->delays = [];
         $this->venues = [];
         $this->orders = [];
         $this->trace = [];
@@ -307,13 +316,13 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         $this->handle();
 
         self::assertSame([
-            'coinbase:buy:start',
-            'coinbase:buy:end',
-            'kraken:sell:start',
-            'kraken:sell:threw',
-            'coinbase:sell:start',
-            'coinbase:sell:end',
-        ], $this->trace);
+            'coinbase:buy:dispatched',
+            'kraken:sell:dispatched',
+            'coinbase:buy:filled',
+            'kraken:sell:failed',
+            'coinbase:sell:unwind',
+            'coinbase:sell:unwind-filled',
+        ], $this->trace, 'the unwind must not race the leg that has not reported yet');
     }
 
     public function testAPartialFillIsAnnouncedAsCritical(): void
@@ -608,26 +617,82 @@ final class ExecuteArbitrageHandlerTest extends TestCase
 
     // ---------------------------------------------------------------- CONCURRENCY
 
-    /**
-     * The promise wrapper does not make the legs concurrent. Guzzle promises only
-     * parallelise transports that cooperate with the event loop (curl_multi); a
-     * blocking CCXT call inside a wait() callback runs to completion before the
-     * next promise is waited on. The trace below shows leg two starting only after
-     * leg one returned — that serialisation *is* the exposure window the unwind
-     * logic exists to cover, so it is asserted rather than assumed.
-     */
-    public function testTheLegsExecuteSequentiallyDespiteThePromiseWrapper(): void
+    public function testBothLegsAreOnTheWireBeforeEitherOneSettles(): void
     {
         $this->fillBothLegs();
 
         $this->handle();
 
         self::assertSame([
-            'coinbase:buy:start',
-            'coinbase:buy:end',
-            'kraken:sell:start',
-            'kraken:sell:end',
+            'coinbase:buy:dispatched',
+            'kraken:sell:dispatched',
+            'coinbase:buy:filled',
+            'kraken:sell:filled',
         ], $this->trace);
+    }
+
+    /**
+     * The decisive one. The buy leg is made the slower of the two, so if the legs were
+     * serialised — as they were under the old Guzzle wrapper around blocking cURL — the
+     * buy would have to settle before the sell was even dispatched. Seeing the sell
+     * settle first proves the two requests genuinely overlap.
+     */
+    public function testASlowLegDoesNotHoldUpTheOtherOne(): void
+    {
+        $this->fillBothLegs();
+        $this->delays[self::BUY_VENUE . ':buy'] = 0.03;
+        $this->delays[self::SELL_VENUE . ':sell'] = 0.0;
+
+        $this->handle();
+
+        self::assertSame([
+            'coinbase:buy:dispatched',
+            'kraken:sell:dispatched',
+            'kraken:sell:filled',
+            'coinbase:buy:filled',
+        ], $this->trace);
+    }
+
+    /**
+     * Wall-clock proof of the same thing: two legs of 30ms each must take ~30ms
+     * together, not ~60ms. The bound is loose enough not to flake on a busy machine
+     * but far below what serialised execution could achieve.
+     */
+    public function testConcurrentLegsCostOneLegOfLatencyNotTwo(): void
+    {
+        $this->fillBothLegs();
+        $this->delays[self::BUY_VENUE . ':buy'] = 0.03;
+        $this->delays[self::SELL_VENUE . ':sell'] = 0.03;
+
+        $this->handle();
+
+        $latency = $this->persistedExecution()->executionTimeMs;
+
+        self::assertGreaterThanOrEqual(30, $latency, 'both legs really did wait ~30ms');
+        self::assertLessThan(55, $latency, 'serialised execution would have cost ~60ms');
+    }
+
+    /**
+     * A leg that fails fast must not shorten the wait for one that is still live —
+     * that is what would leave an unknown position open on the slow venue.
+     */
+    public function testAFastFailureStillWaitsForTheLegThatIsStillInFlight(): void
+    {
+        $this->outcomes[self::BUY_VENUE . ':buy'] = new \RuntimeException('rejected instantly');
+        $this->outcomes[self::SELL_VENUE . ':sell'] = self::SELL_FILL;
+        $this->delays[self::SELL_VENUE . ':sell'] = 0.03;
+
+        $this->handle();
+
+        self::assertSame([
+            'coinbase:buy:dispatched',
+            'kraken:sell:dispatched',
+            'coinbase:buy:failed',
+            'kraken:sell:filled',
+            'kraken:buy:unwind',
+            'kraken:buy:unwind-filled',
+        ], $this->trace);
+        self::assertSame('PARTIAL_SELL_UNWOUND', $this->persistedExecution()->status);
     }
 
     // -------------------------------------------------------------------- HELPERS
@@ -693,39 +758,91 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         return $this->venues[$name] ??= $this->makeVenue($name);
     }
 
+    /**
+     * Both halves of the interface are stubbed, because the handler uses both: the two
+     * arbitrage legs go through the async method, while the emergency unwind — a single
+     * call with nothing to overlap — stays synchronous. The trace labels say which
+     * mechanism produced each event so the ordering assertions stay readable.
+     */
     private function makeVenue(string $name): ExchangeServiceInterface
     {
         $venue = $this->createStub(ExchangeServiceInterface::class);
 
+        $venue->method('executeMarketOrderAsync')->willReturnCallback(
+            function (string $symbol, string $side, float $amount) use ($name): PromiseInterface {
+                $this->recordOrder($name, $symbol, $side, $amount);
+                $this->trace[] = "{$name}:{$side}:dispatched";
+
+                // Settling on a loop timer rather than immediately is what makes the
+                // legs overlap — exactly as a real in-flight HTTP request would.
+                $deferred = new Deferred();
+
+                Loop::addTimer(
+                    $this->delays["{$name}:{$side}"] ?? 0.0,
+                    function () use ($deferred, $name, $side): void {
+                        $outcome = $this->outcomeFor($name, $side);
+
+                        if ($outcome instanceof \Throwable) {
+                            $this->trace[] = "{$name}:{$side}:failed";
+                            $deferred->reject($outcome);
+
+                            return;
+                        }
+
+                        $this->trace[] = "{$name}:{$side}:filled";
+                        $deferred->resolve($outcome);
+                    }
+                );
+
+                return $deferred->promise();
+            }
+        );
+
+        // Reached only via the emergency unwind.
         $venue->method('executeMarketOrder')->willReturnCallback(
             function (string $symbol, string $side, float $amount) use ($name): array {
-                $this->trace[] = "{$name}:{$side}:start";
-                $this->orders[] = [
-                    'venue' => $name,
-                    'symbol' => $symbol,
-                    'side' => $side,
-                    'amount' => $amount,
-                ];
+                $this->recordOrder($name, $symbol, $side, $amount);
+                $this->trace[] = "{$name}:{$side}:unwind";
 
-                $outcome = $this->outcomes["{$name}:{$side}"] ?? ['id' => "auto-{$name}-{$side}"];
+                $outcome = $this->outcomeFor($name, $side);
 
                 if ($outcome instanceof \Throwable) {
-                    $this->trace[] = "{$name}:{$side}:threw";
+                    $this->trace[] = "{$name}:{$side}:unwind-failed";
 
                     throw $outcome;
                 }
 
-                if ($outcome instanceof \Closure) {
-                    $outcome = $outcome();
-                }
-
-                $this->trace[] = "{$name}:{$side}:end";
+                $this->trace[] = "{$name}:{$side}:unwind-filled";
 
                 return $outcome;
             }
         );
 
+        $venue->method('warmUp')->willReturnCallback(
+            static fn (): PromiseInterface => resolve(null)
+        );
+
         return $venue;
+    }
+
+    private function recordOrder(string $venue, string $symbol, string $side, float $amount): void
+    {
+        $this->orders[] = [
+            'venue' => $venue,
+            'symbol' => $symbol,
+            'side' => $side,
+            'amount' => $amount,
+        ];
+    }
+
+    /**
+     * @return array|\Throwable the fill payload, or the failure to raise
+     */
+    private function outcomeFor(string $venue, string $side): array|\Throwable
+    {
+        $outcome = $this->outcomes["{$venue}:{$side}"] ?? ['id' => "auto-{$venue}-{$side}"];
+
+        return $outcome instanceof \Closure ? $outcome() : $outcome;
     }
 
     private function circuitBreaker(): TradingCircuitBreaker

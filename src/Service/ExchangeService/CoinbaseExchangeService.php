@@ -2,7 +2,7 @@
 
 namespace App\Service\ExchangeService;
 
-use ccxt\coinbase;
+use ccxt\async\coinbase;
 use ccxt\ExchangeError;
 use Symfony\Component\DependencyInjection\Attribute\AsTaggedItem;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;

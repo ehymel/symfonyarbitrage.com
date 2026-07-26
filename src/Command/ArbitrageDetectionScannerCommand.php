@@ -6,10 +6,10 @@ use App\Entity\ArbitrageOpportunity;
 use App\Message\ExecuteArbitrageMessage;
 use App\Service\ArbitrageEvaluator;
 use App\Service\ExchangeFactory;
+use App\Service\ExchangeWarmer;
+use App\Service\OrderBookFetcher;
 use App\Service\TradingCircuitBreaker;
 use Doctrine\ORM\EntityManagerInterface;
-use GuzzleHttp\Promise\Promise;
-use GuzzleHttp\Promise\Utils;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
@@ -30,6 +30,8 @@ class ArbitrageDetectionScannerCommand extends Command
 
     public function __construct(
         private ExchangeFactory $exchangeFactory,
+        private ExchangeWarmer $exchangeWarmer,
+        private OrderBookFetcher $orderBookFetcher,
         private ArbitrageEvaluator $evaluator,
         private TradingCircuitBreaker $circuitBreaker,
         private MessageBusInterface $bus,
@@ -49,11 +51,17 @@ class ArbitrageDetectionScannerCommand extends Command
             $instances[$name] = $this->exchangeFactory->create($name);
         }
 
+        // Pre-load market metadata for every venue at once, so the first scan iteration
+        // is not paying for a markets fetch it will never need again.
+        $this->exchangeWarmer->warm(...$this->exchangesToScan);
+        $output->writeln("📈 Markets pre-loaded for: " . implode(', ', $this->exchangesToScan));
+
         // Infinite polling loop
         while (true) {
             foreach ($this->tradingPairs as $pair) {
                 try {
-                    $orderBooks = $this->fetchOrderBooksConcurrently($instances, $pair);
+                    // Fetch top 10 order book levels from every venue simultaneously
+                    $orderBooks = $this->orderBookFetcher->fetchConcurrently($instances, $pair, 10);
 
                     // Cross-compare all exchange combinations (e.g. Coinbase vs Kraken, Kraken vs Binance)
                     foreach ($this->exchangesToScan as $buyEx) {
@@ -95,36 +103,6 @@ class ArbitrageDetectionScannerCommand extends Command
         }
 
         return Command::SUCCESS;
-    }
-
-    /**
-     * Fetches order books simultaneously from all configured exchanges.
-     */
-    private function fetchOrderBooksConcurrently(array $instances, string $symbol): array
-    {
-        $promises = [];
-
-        foreach ($instances as $name => $exchange) {
-            $promises[$name] = new Promise(function () use (&$promises, $exchange, $name, $symbol) {
-                try {
-                    $book = $exchange->getOrderBook($symbol, 10); // Fetch top 10 order book levels
-                    $promises[$name]->resolve($book);
-                } catch (\Throwable $e) {
-                    $promises[$name]->reject($e);
-                }
-            });
-        }
-
-        $settled = Utils::settle($promises)->wait();
-        $orderBooks = [];
-
-        foreach ($settled as $name => $result) {
-            if ($result['state'] === 'fulfilled') {
-                $orderBooks[$name] = $result['value'];
-            }
-        }
-
-        return $orderBooks;
     }
 
     /**

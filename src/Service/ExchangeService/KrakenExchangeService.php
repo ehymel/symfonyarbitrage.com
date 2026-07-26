@@ -2,8 +2,8 @@
 
 namespace App\Service\ExchangeService;
 
+use ccxt\async\kraken;
 use ccxt\ExchangeError;
-use ccxt\kraken;
 use Symfony\Component\DependencyInjection\Attribute\AsTaggedItem;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
 
