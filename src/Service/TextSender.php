@@ -6,9 +6,9 @@ use Symfony\Component\Notifier\Exception\TransportExceptionInterface;
 use Symfony\Component\Notifier\Message\SmsMessage;
 use Symfony\Component\Notifier\TexterInterface;
 
-class TextSender
+readonly class TextSender
 {
-    public function __construct(private readonly TexterInterface $texter)
+    public function __construct(private TexterInterface $texter)
     {}
 
     /**

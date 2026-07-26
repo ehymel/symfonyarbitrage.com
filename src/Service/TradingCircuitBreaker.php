@@ -12,18 +12,19 @@ use Psr\Log\LoggerInterface;
 
 class TradingCircuitBreaker
 {
-    private const STATE_CLOSED = 'CLOSED';
-    private const STATE_OPEN = 'OPEN';
-    private const STATE_HALF_OPEN = 'HALF_OPEN';
+    private const string STATE_CLOSED = 'CLOSED';
+    private const string STATE_OPEN = 'OPEN';
+    private const string STATE_HALF_OPEN = 'HALF_OPEN';
 
     public function __construct(
-        private CacheInterface $cache,
-        private TexterInterface $texter,
-        private LoggerInterface $logger,
-        #[Autowire(env: 'ADMIN_PHONE_NUMBER')] private string $adminPhoneNumber,
-        private int $maxFailures = 2,
-        private int $maxLatencyMs = 450,    // may need to be adjusted after making buy/sell orders truly concurrent in ExecuteArbitrageHandler
-        private int $cooldownSeconds = 300, // 5-minute pause
+        private readonly CacheInterface  $cache,
+        private readonly TexterInterface $texter,
+        private readonly LoggerInterface $logger,
+        #[Autowire(env: 'ADMIN_PHONE_NUMBER')]
+        private readonly string          $adminPhoneNumber,
+        private readonly int             $maxFailures = 2,
+        private readonly int             $maxLatencyMs = 450,    // may need to be adjusted after making buy/sell orders truly concurrent in ExecuteArbitrageHandler
+        private readonly int             $cooldownSeconds = 300, // 5-minute pause
     ) {}
 
     /**

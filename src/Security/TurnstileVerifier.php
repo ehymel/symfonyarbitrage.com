@@ -10,7 +10,7 @@ use Symfony\Contracts\HttpClient\HttpClientInterface;
 
 class TurnstileVerifier
 {
-    private const VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+    private const string VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
 
     public function __construct(
         private readonly HttpClientInterface $httpClient,
@@ -22,7 +22,7 @@ class TurnstileVerifier
     /**
      * Validates a Turnstile token against Cloudflare's siteverify endpoint.
      *
-     * Fails closed: any missing token, transport error or non-true `success`
+     * Fails closed: any missing token, transport error, or non-true `success`
      * field results in false, so callers can gate on a plain boolean.
      *
      * The token is nullable because that is exactly what a bot submitting the bare
@@ -66,7 +66,7 @@ class TurnstileVerifier
         }
 
         // Cloudflare reports the reason here; without it, a broken secret is
-        // indistinguishable from a bot and the integration looks like a no-op.
+        // indistinguishable from a bot, and the integration looks like a no-op.
         $this->logger?->warning('Turnstile verification rejected the token: {codes}', [
             'codes' => implode(', ', $data['error-codes'] ?? ['unknown']),
         ]);

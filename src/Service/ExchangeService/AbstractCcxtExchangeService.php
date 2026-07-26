@@ -41,7 +41,7 @@ abstract class AbstractCcxtExchangeService implements ExchangeServiceInterface
     abstract protected static function ccxtClass(): string;
 
     /**
-     * @throws NotSupported
+     * @throws NotSupported|\Throwable
      */
     public function getBalance(): array
     {
@@ -49,26 +49,32 @@ abstract class AbstractCcxtExchangeService implements ExchangeServiceInterface
     }
 
     /**
-     * @throws NotSupported
+     * @throws NotSupported|\Throwable
      */
     public function getOrderBook(string $symbol = 'ETH/USDT', ?int $limit = null): array
     {
         return await($this->getOrderBookAsync($symbol, $limit));
     }
 
+    /**
+     * @throws NotSupported
+     */
     public function getOrderBookAsync(string $symbol = 'ETH/USDT', ?int $limit = null): PromiseInterface
     {
         return $this->exchange->fetch_order_book($symbol, $limit);
     }
 
     /**
-     * @throws ExchangeError
+     * @throws ExchangeError|\Throwable
      */
     public function executeMarketOrder(string $symbol, string $side, float $amount): array
     {
         return await($this->executeMarketOrderAsync($symbol, $side, $amount));
     }
 
+    /**
+     * @throws NotSupported
+     */
     public function executeMarketOrderAsync(string $symbol, string $side, float $amount): PromiseInterface
     {
         // CCXT forwards $side verbatim to the exchange API, which expects it lowercase.

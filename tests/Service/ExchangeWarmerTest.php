@@ -16,10 +16,9 @@ use React\Promise\PromiseInterface;
 use Symfony\Component\DependencyInjection\ServiceLocator;
 
 use function React\Promise\reject;
-use function React\Promise\resolve;
 
 /**
- * The warmer exists to move a markets fetch off the critical path of a live trade, and
+ * The warmer exists to move a market's fetch off the critical path of a live trade, and
  * its one hard rule is that it must never be the reason a worker fails to boot. Both
  * halves are asserted here: that every venue is warmed in one concurrent pass, and that
  * an unreachable venue degrades to a log line rather than an exception.
@@ -45,7 +44,7 @@ final class ExchangeWarmerTest extends TestCase
 
     public function testEveryWiredVenueIsWarmed(): void
     {
-        $this->warmUps = ['coinbase' => resolve(null), 'kraken' => resolve(null)];
+        $this->warmUps = ['coinbase' => $this->resolved(), 'kraken' => $this->resolved()];
 
         $this->warmer()->warmAll();
 
@@ -54,7 +53,7 @@ final class ExchangeWarmerTest extends TestCase
 
     public function testOnlyTheNamedVenuesAreWarmed(): void
     {
-        $this->warmUps = ['coinbase' => resolve(null), 'kraken' => resolve(null)];
+        $this->warmUps = ['coinbase' => $this->resolved(), 'kraken' => $this->resolved()];
 
         $this->warmer()->warm('kraken');
 
@@ -63,7 +62,7 @@ final class ExchangeWarmerTest extends TestCase
 
     public function testASuccessfulWarmUpIsLogged(): void
     {
-        $this->warmUps = ['kraken' => resolve(null)];
+        $this->warmUps = ['kraken' => $this->resolved()];
 
         $this->warmer()->warm('kraken');
 
@@ -94,7 +93,7 @@ final class ExchangeWarmerTest extends TestCase
     public function testVenuesAreWarmedConcurrentlyRatherThanOneAfterAnother(): void
     {
         // Coinbase resolves later than kraken despite being requested first; if the
-        // warmer awaited each in turn this would cost the sum, not the max.
+        // warmer awaited each in turn, this would cost the sum, not the max.
         $this->warmUps = [
             'coinbase' => $this->resolveAfter(0.04),
             'kraken' => $this->resolveAfter(0.04),
@@ -138,7 +137,7 @@ final class ExchangeWarmerTest extends TestCase
 
     public function testAnUnknownVenueIsReportedRatherThanThrown(): void
     {
-        $this->warmUps = ['kraken' => resolve(null)];
+        $this->warmUps = ['kraken' => $this->resolved()];
 
         $this->warmer()->warm('ftx', 'kraken');
 
@@ -186,6 +185,24 @@ final class ExchangeWarmerTest extends TestCase
         );
 
         return $venue;
+    }
+
+    /**
+     * A promise that has already fulfilled.
+     *
+     * Built from a Deferred rather than React\Promise\resolve(), whose documented
+     * parameter unions the plain value with PromiseInterface itself; static analysis
+     * matches against the promise arm and reports a plain value as a type error.
+     * Same promise either way.
+     *
+     * @return PromiseInterface<null>
+     */
+    private function resolved(): PromiseInterface
+    {
+        $deferred = new Deferred();
+        $deferred->resolve(null);
+
+        return $deferred->promise();
     }
 
     /**

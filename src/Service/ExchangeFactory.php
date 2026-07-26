@@ -3,17 +3,23 @@
 namespace App\Service;
 
 use App\Service\ExchangeService\ExchangeServiceInterface;
+use Psr\Container\ContainerExceptionInterface;
+use Psr\Container\NotFoundExceptionInterface;
 use Symfony\Component\DependencyInjection\Attribute\AutowireLocator;
 use Symfony\Contracts\Service\ServiceProviderInterface;
 
-class ExchangeFactory
+readonly class ExchangeFactory
 {
     public function __construct(
         #[AutowireLocator(ExchangeServiceInterface::class)]
-        private readonly ServiceProviderInterface $exchanges
+        private ServiceProviderInterface $exchanges
     ) {
     }
 
+    /**
+     * @throws ContainerExceptionInterface
+     * @throws NotFoundExceptionInterface
+     */
     public function create(string $exchangeName): ExchangeServiceInterface
     {
         $key = strtolower($exchangeName);

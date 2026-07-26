@@ -25,8 +25,6 @@ use Symfony\Component\Notifier\Message\SentMessage;
 use Symfony\Component\Notifier\Message\SmsMessage;
 use Symfony\Component\Notifier\TexterInterface;
 
-use function React\Promise\resolve;
-
 /**
  * The handler is a risk machine: it decides what gets sent to a venue, what gets
  * unwound when only one leg lands, and what ends up in the ledger. So the tests
@@ -1191,10 +1189,28 @@ final class ExecuteArbitrageHandlerTest extends TestCase
         );
 
         $venue->method('warmUp')->willReturnCallback(
-            static fn (): PromiseInterface => resolve(null)
+            fn (): PromiseInterface => $this->resolved()
         );
 
         return $venue;
+    }
+
+    /**
+     * A promise that has already fulfilled.
+     *
+     * Built from a Deferred rather than React\Promise\resolve(), whose documented
+     * parameter unions the plain value with PromiseInterface itself; static analysis
+     * matches against the promise arm and reports a plain value as a type error.
+     * Same promise either way.
+     *
+     * @return PromiseInterface<null>
+     */
+    private function resolved(): PromiseInterface
+    {
+        $deferred = new Deferred();
+        $deferred->resolve(null);
+
+        return $deferred->promise();
     }
 
     private function recordOrder(string $venue, string $symbol, string $side, float $amount): void

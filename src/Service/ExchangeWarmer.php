@@ -38,6 +38,7 @@ final readonly class ExchangeWarmer
 
     /**
      * Warms the named venues concurrently. Never throws.
+     * @throws \Throwable
      */
     public function warm(string ...$venues): void
     {

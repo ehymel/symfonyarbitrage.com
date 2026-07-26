@@ -14,7 +14,7 @@ use React\Promise\Deferred;
 use React\Promise\PromiseInterface;
 
 /**
- * Two properties matter here and both are asserted directly rather than inferred:
+ * Two properties matter here, and both are asserted directly rather than inferred:
  * the reads genuinely overlap (a slow venue must not delay a fast one), and a venue
  * that fails drops out of the round instead of taking the scan down with it.
  */
@@ -245,7 +245,7 @@ final class OrderBookFetcherTest extends TestCase
             $venues[$name] = $this->venue($name);
         }
 
-        return (new OrderBookFetcher($this->recordingLogger()))->fetchConcurrently($venues, $symbol, $limit);
+        return new OrderBookFetcher($this->recordingLogger())->fetchConcurrently($venues, $symbol, $limit);
     }
 
     private function venue(string $name): ExchangeServiceInterface

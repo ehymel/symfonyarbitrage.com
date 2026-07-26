@@ -35,7 +35,7 @@ readonly class ExecuteArbitrageHandler
     ) {}
 
     /**
-     * @throws InvalidArgumentException|ORMException|TransportExceptionInterface
+     * @throws InvalidArgumentException|ORMException|\Throwable
      */
     public function __invoke(ExecuteArbitrageMessage $message): void
     {
@@ -43,6 +43,10 @@ readonly class ExecuteArbitrageHandler
         $sellExchangeName = $message->getSellExchange();
 
         // 1. PRE-FLIGHT CHECK: Circuit Breaker Check
+        // The one breaker call left unguarded, and deliberately so — see guardBreaker().
+        // Nothing has been traded yet, so an exception here aborts with no position open
+        // and no record owed. Failing loudly and letting Messenger retry is the correct
+        // response to "we cannot tell whether this venue is safe to trade".
         if (!$this->circuitBreaker->isAllowed($buyExchangeName) || !$this->circuitBreaker->isAllowed($sellExchangeName)) {
             $this->logger->warning("Execution aborted by Circuit Breaker for opportunity {$message->getOpportunityId()}");
             return;
@@ -105,7 +109,7 @@ readonly class ExecuteArbitrageHandler
             $unwind = $this->unwindPosition($buyExchange, $buyExchangeName, 'sell', $message);
 
             // The reversing order is the sell side of what actually happened, so it goes in
-            // the sell slot: the row then carries the realised loss on the round trip rather
+            // the sell slot: the row then carries the realized loss on the round trip rather
             // than an empty leg and a null P&L.
             $this->logExecutionToRds(
                 $message,
@@ -163,7 +167,7 @@ readonly class ExecuteArbitrageHandler
      *
      * Returning the reversing order rather than nothing is what lets the caller tell a
      * flattened position from an open one — the two used to be indistinguishable in the
-     * ledger — and gives it the fill needed to record the realised loss.
+     * ledger — and gives it the fill needed to record the realized loss.
      *
      * Deliberately does NOT consult the circuit breaker. An unwind reduces risk rather
      * than taking it, and the venue holding the position may well have just been tripped
@@ -233,7 +237,7 @@ readonly class ExecuteArbitrageHandler
      * the moment things are already going wrong. Unguarded, a cache blip during a partial
      * fill would abort this handler before the unwind ran and before the ledger row was
      * written, turning a recoverable incident into an orphaned position nobody knows
-     * about. A degraded breaker is a problem; losing the trade record is a worse one.
+     * about. A degraded breaker is a problem; losing the trade record is worse.
      */
     private function guardBreaker(callable $update, string $context): void
     {
@@ -297,7 +301,7 @@ readonly class ExecuteArbitrageHandler
         if ($buyResult && $sellResult) {
             // The quote is only a legitimate fallback for a trade that executed as quoted.
             // On an unwound partial fill one of these legs is the reversing order, which the
-            // quote never described — falling back to it there would turn a realised loss
+            // quote never described — falling back to it there would turn a realized loss
             // into a fabricated profit, so leave the P&L unknown instead.
             $quotedFallbackApplies = $status === 'COMPLETED';
 
