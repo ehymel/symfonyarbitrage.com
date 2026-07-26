@@ -35,17 +35,17 @@ class ArbitrageDetectionScannerCommand extends Command
     private bool $writeFailureAlerted = false;
 
     public function __construct(
-        private ExchangeFactory $exchangeFactory,
-        private ExchangeWarmer $exchangeWarmer,
-        private OrderBookFetcher $orderBookFetcher,
-        private ArbitrageEvaluator $evaluator,
-        private TradingCircuitBreaker $circuitBreaker,
-        private MessageBusInterface $bus,
-        private EntityManagerInterface $em,
-        private LoggerInterface $logger,
-        private AdminAlerter $adminAlerter,
+        private readonly ExchangeFactory        $exchangeFactory,
+        private readonly ExchangeWarmer         $exchangeWarmer,
+        private readonly OrderBookFetcher       $orderBookFetcher,
+        private readonly ArbitrageEvaluator     $evaluator,
+        private readonly TradingCircuitBreaker  $circuitBreaker,
+        private readonly MessageBusInterface    $bus,
+        private readonly EntityManagerInterface $em,
+        private readonly LoggerInterface        $logger,
+        private readonly AdminAlerter           $adminAlerter,
         /** Pause after a write failure that left the connection usable. */
-        private int $writeFailureBackoffSeconds = 5,
+        private readonly int                    $writeFailureBackoffSeconds = 5,
     ) {
         parent::__construct();
     }
