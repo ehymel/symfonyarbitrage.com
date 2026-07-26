@@ -18,6 +18,11 @@ class ArbitrageEvaluator
 
     /**
      * Evaluates whether a valid spread exists from Exchange A (Buy) to Exchange B (Sell).
+     *
+     * A null return means "no tradeable spread right now" — an expected, routine outcome.
+     * A misconfigured position size is not that, so it throws instead of going quiet.
+     *
+     * @throws \InvalidArgumentException if the target trade size is not positive
      */
     public function evaluate(
         string $symbol,
@@ -28,6 +33,14 @@ class ArbitrageEvaluator
         float $targetAmountUsd = 100.0, // Target trade size in USD
         float $minNetMarginPct = 0.0035 // Min profit threshold (0.35%)
     ): ?ArbitrageOpportunityDto {
+
+        // A non-positive target fills trivially with zero quantity, which would divide by
+        // zero when deriving the effective prices below.
+        if ($targetAmountUsd <= 0.0) {
+            throw new \InvalidArgumentException(
+                sprintf('Target trade size must be positive, got %s.', $targetAmountUsd)
+            );
+        }
 
         $asks = $buyOrderBook['asks'] ?? []; // Sellers on Exchange A [[price, qty], ...]
         $bids = $sellOrderBook['bids'] ?? []; // Buyers on Exchange B [[price, qty], ...]

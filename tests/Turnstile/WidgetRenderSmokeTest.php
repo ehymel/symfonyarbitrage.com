@@ -62,6 +62,6 @@ final class WidgetRenderSmokeTest extends WebTestCase
         self::assertEmailCount(0, 'no reset mail may be dispatched when verification fails');
 
         $client->followRedirect();
-        self::assertSelectorTextContains('.alert', 'Bot verification failed');
+        self::assertSelectorTextContains('.alert', 'Security verification failed');
     }
 }

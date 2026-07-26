@@ -6,7 +6,7 @@ namespace App\Tests\Service;
 use App\Service\TradingCircuitBreaker;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
-use Psr\Log\AbstractLogger;
+use Psr\Log\LoggerInterface;
 use Psr\Log\LogLevel;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
 use Symfony\Component\Notifier\Message\MessageInterface;
@@ -33,13 +33,17 @@ final class TradingCircuitBreakerTest extends TestCase
     /** @var list<SmsMessage> */
     private array $sentMessages = [];
 
-    private RecordingLogger $logger;
+    /** @var array<string, list<string>> messages captured per PSR-3 level */
+    private array $loggedMessages = [];
+
+    private LoggerInterface $logger;
 
     protected function setUp(): void
     {
         $this->cache = new ArrayAdapter();
         $this->sentMessages = [];
-        $this->logger = new RecordingLogger();
+        $this->loggedMessages = [];
+        $this->logger = $this->recordingLogger();
     }
 
     // ---------------------------------------------------------------- CLOSED
@@ -418,27 +422,33 @@ final class TradingCircuitBreakerTest extends TestCase
     }
 
     /**
+     * Captures the two PSR-3 levels the breaker actually uses. Stubbing warning()
+     * and critical() directly also pins *which* level each event is reported at —
+     * a routed-through log() double would let a severity downgrade slip past.
+     */
+    private function recordingLogger(): LoggerInterface
+    {
+        $logger = $this->createStub(LoggerInterface::class);
+
+        $logger->method('warning')->willReturnCallback(
+            function (string|\Stringable $message): void {
+                $this->loggedMessages[LogLevel::WARNING][] = (string) $message;
+            }
+        );
+        $logger->method('critical')->willReturnCallback(
+            function (string|\Stringable $message): void {
+                $this->loggedMessages[LogLevel::CRITICAL][] = (string) $message;
+            }
+        );
+
+        return $logger;
+    }
+
+    /**
      * @return list<string>
      */
     private function logMessages(string $level): array
     {
-        return array_values(array_map(
-            static fn(array $record): string => $record['message'],
-            array_filter($this->logger->records, static fn(array $record): bool => $record['level'] === $level)
-        ));
-    }
-}
-
-/**
- * Captures log calls so tests can assert on the messages the breaker emits.
- */
-final class RecordingLogger extends AbstractLogger
-{
-    /** @var list<array{level: string, message: string}> */
-    public array $records = [];
-
-    public function log($level, string|\Stringable $message, array $context = []): void
-    {
-        $this->records[] = ['level' => (string) $level, 'message' => (string) $message];
+        return $this->loggedMessages[$level] ?? [];
     }
 }

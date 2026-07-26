@@ -24,8 +24,12 @@ class TurnstileVerifier
      *
      * Fails closed: any missing token, transport error or non-true `success`
      * field results in false, so callers can gate on a plain boolean.
+     *
+     * The token is nullable because that is exactly what a bot submitting the bare
+     * form produces — `$request->request->get()` returns null, and rejecting it is
+     * this method's job, not a TypeError's.
      */
-    public function verify(string $token, ?string $remoteIp = null): bool
+    public function verify(?string $token, ?string $remoteIp = null): bool
     {
         if (empty($token)) {
             $this->logger?->warning('Turnstile verification failed: no token present in the request.');
