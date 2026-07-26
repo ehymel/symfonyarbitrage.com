@@ -15,11 +15,13 @@ use App\Service\OrderBookFetcher;
 use App\Service\TradingCircuitBreaker;
 use Doctrine\ORM\EntityManagerInterface;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use Psr\Log\LogLevel;
 use React\Promise\Deferred;
 use React\Promise\PromiseInterface;
+use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Tester\CommandTester;
 use Symfony\Component\DependencyInjection\ServiceLocator;
 use Symfony\Component\Messenger\Envelope;
@@ -302,6 +304,220 @@ final class ArbitrageDetectionScannerCommandTest extends TestCase
         self::assertSame('coinbase', $this->dispatched[0]->getSellExchange());
     }
 
+    // ------------------------------------------------------------- POSITION SIZE
+
+    /**
+     * --size is the dial between "prove the pipeline works" and "put real money through
+     * it", so what it actually controls is the quantity on the order that reaches a venue.
+     * Everything else about the opportunity is unchanged by it.
+     */
+    public function testThePositionSizeReachesTheDispatchedTrade(): void
+    {
+        $this->books = $this->profitableSpread();
+
+        $this->execute(size: 500.0);
+
+        self::assertEqualsWithDelta(5.0, $this->dispatched[0]->getAmount(), 1e-9, '$500 of a $100 ask');
+    }
+
+    public function testTheDefaultIsAHundredDollarsWhenTheOptionIsOmitted(): void
+    {
+        $this->books = $this->profitableSpread();
+
+        $this->execute();
+
+        self::assertEqualsWithDelta(1.0, $this->dispatched[0]->getAmount(), 1e-9);
+    }
+
+    /** The reason the option exists: a run that can only ever be wrong by $25. */
+    public function testASmallSizeLimitsWhatOneOpportunityCanCommit(): void
+    {
+        $this->books = $this->profitableSpread();
+
+        $this->execute(size: 25.0);
+
+        self::assertEqualsWithDelta(0.25, $this->dispatched[0]->getAmount(), 1e-9);
+    }
+
+    public function testAFractionalSizeIsHonouredRatherThanRounded(): void
+    {
+        $this->books = $this->profitableSpread();
+
+        $this->execute(size: '12.50');
+
+        self::assertEqualsWithDelta(0.125, $this->dispatched[0]->getAmount(), 1e-9);
+    }
+
+    /**
+     * Sizing past the visible book is not an opportunity at any price: the evaluator cannot
+     * fill it, so nothing is dispatched. Worth pinning, because the failure mode of getting
+     * this wrong would be a trade priced off liquidity that was never there.
+     */
+    public function testASizeTheBookCannotFillProducesNoOpportunity(): void
+    {
+        $this->books = $this->profitableSpread();
+
+        // The ask holds 10.0 at 100, so $1,500 wants 15.0 and only 10.0 exists.
+        $this->execute(size: 1_500.0);
+
+        self::assertSame([], $this->dispatched);
+        self::assertSame([], $this->persisted);
+    }
+
+    public function testTheBannerStatesWhatEachOpportunityWillCommit(): void
+    {
+        $tester = $this->execute(size: 2_500.0);
+
+        self::assertStringContainsString('committing $2,500.00 per opportunity', $tester->getDisplay());
+    }
+
+    /**
+     * A size that is not a size stops the run rather than being coerced into one. Left to
+     * the evaluator this would throw from inside the scan loop's catch-all — four times a
+     * second, forever, with the process still apparently running.
+     */
+    #[DataProvider('unusableSizeProvider')]
+    public function testAnUnusableSizeStopsTheRunBeforeItStarts(string $size, string $expectedMessage): void
+    {
+        $this->books = $this->profitableSpread();
+
+        $tester = $this->execute(size: $size);
+
+        self::assertSame(Command::INVALID, $tester->getStatusCode());
+        self::assertStringContainsString($expectedMessage, $tester->getDisplay());
+        self::assertSame([], $this->dispatched, 'nothing may be traded on a size nobody meant');
+    }
+
+    public static function unusableSizeProvider(): iterable
+    {
+        yield 'not a number' => ['abc', '--size must be an amount in USD, got "abc"'];
+        yield 'typo for 100' => ['1o0', '--size must be an amount in USD'];
+        yield 'amount with units' => ['100 USD', '--size must be an amount in USD'];
+        yield 'zero' => ['0', '--size must be greater than zero'];
+        yield 'negative' => ['-100', '--size must be greater than zero'];
+        yield 'empty' => ['', '--size must be an amount in USD'];
+    }
+
+    public function testAnUnusableSizeIsCaughtBeforeAnythingIsWarmedOrRead(): void
+    {
+        $this->books = $this->profitableSpread();
+
+        $this->execute(size: '0');
+
+        self::assertSame([], $this->trace, 'no venue should be touched over a bad argument');
+        self::assertSame([], $this->reads);
+    }
+
+    // ------------------------------------------------------------ MARGIN THRESHOLD
+
+    /**
+     * The test spread nets 9.314% after fees — buy 1.0 at 100, sell at 110, less coinbase's
+     * 0.40% and kraken's 0.26%. Either side of that figure is what proves the threshold is
+     * the operator's number and not a constant.
+     */
+    public function testASpreadThinnerThanTheThresholdIsLeftAlone(): void
+    {
+        $this->books = $this->profitableSpread();
+
+        $this->execute(minMargin: 10.0);
+
+        self::assertSame([], $this->dispatched, '9.314% net does not clear a 10% bar');
+        self::assertSame([], $this->persisted);
+    }
+
+    public function testASpreadFatterThanTheThresholdIsTaken(): void
+    {
+        $this->books = $this->profitableSpread();
+
+        $this->execute(minMargin: 9.0);
+
+        self::assertCount(1, $this->dispatched);
+    }
+
+    /** Zero is a real setting: everything the fees do not eat is fair game. */
+    public function testAZeroThresholdTakesEverySpreadThatClearsItsFees(): void
+    {
+        $this->books = $this->profitableSpread();
+
+        $this->execute(minMargin: 0);
+
+        self::assertCount(1, $this->dispatched);
+    }
+
+    public function testTheDefaultThresholdIsThirtyFiveBasisPoints(): void
+    {
+        $tester = $this->execute();
+
+        self::assertStringContainsString('above 0.35% net margin', $tester->getDisplay());
+    }
+
+    public function testTheBannerStatesBothRiskDials(): void
+    {
+        $tester = $this->execute(size: 2_500.0, minMargin: 1.5);
+
+        self::assertStringContainsString(
+            'committing $2,500.00 per opportunity above 1.50% net margin',
+            $tester->getDisplay()
+        );
+    }
+
+    /**
+     * The mistake that costs money rather than opportunities. A fraction typed into a
+     * percentage option sets the bar six thousand times too low and turns the scanner loose
+     * on spreads that cannot pay for themselves, so it is named rather than accepted.
+     */
+    public function testAFractionTypedIntoAPercentageOptionIsRefused(): void
+    {
+        $this->books = $this->profitableSpread();
+
+        $tester = $this->execute(minMargin: '0.0035');
+
+        self::assertSame(Command::INVALID, $tester->getStatusCode());
+        self::assertStringContainsString('--min-margin is a percentage', $tester->getDisplay());
+        self::assertStringContainsString('Did you mean 0.35?', $tester->getDisplay());
+        self::assertSame([], $this->dispatched);
+    }
+
+    #[DataProvider('unusableMarginProvider')]
+    public function testAnUnusableThresholdStopsTheRunBeforeItStarts(string $margin, string $expectedMessage): void
+    {
+        $this->books = $this->profitableSpread();
+
+        $tester = $this->execute(minMargin: $margin);
+
+        self::assertSame(Command::INVALID, $tester->getStatusCode());
+        self::assertStringContainsString($expectedMessage, $tester->getDisplay());
+        self::assertSame([], $this->dispatched);
+    }
+
+    public static function unusableMarginProvider(): iterable
+    {
+        yield 'not a number' => ['abc', '--min-margin must be a percentage, got "abc"'];
+        yield 'percent sign included' => ['0.35%', '--min-margin must be a percentage'];
+        yield 'empty' => ['', '--min-margin must be a percentage'];
+        yield 'negative' => ['-0.35', '--min-margin cannot be negative'];
+    }
+
+    public function testAnUnusableThresholdIsCaughtBeforeAnythingIsWarmedOrRead(): void
+    {
+        $this->books = $this->profitableSpread();
+
+        $this->execute(minMargin: '-1');
+
+        self::assertSame([], $this->trace, 'no venue should be touched over a bad argument');
+        self::assertSame([], $this->reads);
+    }
+
+    /** Both dials are reported together, so one bad argument does not hide the other. */
+    public function testTwoBadArgumentsAreBothReported(): void
+    {
+        $tester = $this->execute(size: '0', minMargin: 'abc');
+
+        self::assertSame(Command::INVALID, $tester->getStatusCode());
+        self::assertStringContainsString('--size must be greater than zero', $tester->getDisplay());
+        self::assertStringContainsString('--min-margin must be a percentage', $tester->getDisplay());
+    }
+
     // ---------------------------------------------------------- CIRCUIT BREAKER
 
     public function testAVenueBehindAnOpenBreakerIsNeverTraded(): void
@@ -512,8 +728,12 @@ final class ArbitrageDetectionScannerCommandTest extends TestCase
         ];
     }
 
-    private function execute(int $limit = 1, ?MessageBusInterface $bus = null): CommandTester
-    {
+    private function execute(
+        int $limit = 1,
+        ?MessageBusInterface $bus = null,
+        string|float|null $size = null,
+        string|float|null $minMargin = null,
+    ): CommandTester {
         $factory = new ExchangeFactory(new ServiceLocator([
             'coinbase' => fn(): ExchangeServiceInterface => $this->venue('coinbase'),
             'kraken' => fn(): ExchangeServiceInterface => $this->venue('kraken'),
@@ -533,8 +753,18 @@ final class ArbitrageDetectionScannerCommandTest extends TestCase
             writeFailureBackoffSeconds: 0,
         );
 
+        $options = ['--limit' => $limit];
+
+        if ($size !== null) {
+            $options['--size'] = $size;
+        }
+
+        if ($minMargin !== null) {
+            $options['--min-margin'] = $minMargin;
+        }
+
         $tester = new CommandTester($command);
-        $tester->execute(['--limit' => $limit]);
+        $tester->execute($options);
 
         return $tester;
     }

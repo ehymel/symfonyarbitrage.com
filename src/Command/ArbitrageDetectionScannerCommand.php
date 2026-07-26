@@ -12,6 +12,8 @@ use App\Service\ExchangeWarmer;
 use App\Service\OrderBookFetcher;
 use App\Service\TradingCircuitBreaker;
 use Doctrine\ORM\EntityManagerInterface;
+use Psr\Container\ContainerExceptionInterface;
+use Psr\Container\NotFoundExceptionInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
@@ -27,6 +29,31 @@ use Symfony\Component\Messenger\MessageBusInterface;
 )]
 class ArbitrageDetectionScannerCommand extends Command
 {
+    /**
+     * Capital committed to a single opportunity when --size is not given.
+     *
+     * Deliberately small. This is the number that decides how much real money a bug in the
+     * rest of the pipeline can move, so the default is the one that hurts least and every
+     * increase is a decision someone made on purpose at the command line.
+     */
+    private const float DEFAULT_TARGET_AMOUNT_USD = 100.0;
+
+    /**
+     * Minimum net margin, as a percentage, for a spread to be worth executing.
+     *
+     * Net of both venues' taker fees, so this is profit and not spread: the combined fees
+     * in ArbitrageEvaluator already run to about 0.66%, and anything left over is what this
+     * threshold measures. Set low enough to be worth the risk of the trade, high enough
+     * that the edge is not eaten by the slippage between quoting and filling.
+     */
+    private const float DEFAULT_MIN_NET_MARGIN_PCT = 0.35;
+
+    /**
+     * Below this, --min-margin is almost certainly a fraction typed where a percentage was
+     * wanted — 0.0035 for 0.35% — which reads as no threshold at all.
+     */
+    private const float IMPLAUSIBLY_SMALL_MARGIN_PCT = 0.01;
+
 //    private array $exchangesToScan = ['coinbase', 'kraken', 'binance'];
     private array $exchangesToScan = ['coinbase', 'kraken'];
     private array $tradingPairs = ['ETH/USDT', 'BTC/USDT', 'SOL/USDT'];
@@ -59,11 +86,53 @@ class ArbitrageDetectionScannerCommand extends Command
             'Stop after this many scan cycles. 0 runs until interrupted.',
             0
         );
+
+        $this->addOption(
+            'size',
+            's',
+            InputOption::VALUE_REQUIRED,
+            'Capital in USD to commit per opportunity. Keep it small while the pipeline is being proven out.',
+            self::DEFAULT_TARGET_AMOUNT_USD
+        );
+
+        $this->addOption(
+            'min-margin',
+            'm',
+            InputOption::VALUE_REQUIRED,
+            'Minimum net profit to act on, as a percentage after both venues\' fees (default 0.35 = 0.35%). 0 takes every spread that clears its fees.',
+            self::DEFAULT_MIN_NET_MARGIN_PCT
+        );
     }
 
+    /**
+     * @throws ContainerExceptionInterface
+     * @throws NotFoundExceptionInterface
+     * @throws \Throwable
+     */
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $output->writeln("🚀 Arbitrage Detection Engine Started...");
+        // Resolved before anything is warmed or scanned. The evaluator rejects a
+        // non-positive size, but it does so once per venue pair per cycle from inside the
+        // loop's catch-all — four times a second, forever, with the run still "working".
+        // A bad size is a mistake at the keyboard, so it stops here while someone is
+        // still looking at the terminal.
+        $targetAmountUsd = $this->resolveTargetAmount($input, $output);
+        $minNetMarginPct = $this->resolveMinNetMargin($input, $output);
+
+        if ($targetAmountUsd === null || $minNetMarginPct === null) {
+            return Command::INVALID;
+        }
+
+        // Stated up front and unmissably: between them these two decide how much real money
+        // the run can move and how thin an edge it will move it on. A supervised process
+        // that quietly picked up the wrong pair of numbers is the failure worth spending a
+        // line of output on.
+        $output->writeln(sprintf(
+            '🚀 Arbitrage Detection Engine Started... committing $%s per opportunity above %s%% net margin.',
+            number_format($targetAmountUsd, 2),
+            number_format($minNetMarginPct, 2)
+        ));
+
         $this->writeFailureAlerted = false;
 
         // Initialize CCXT instances
@@ -107,8 +176,10 @@ class ArbitrageDetectionScannerCommand extends Command
                                 buyOrderBook: $orderBooks[$buyEx],
                                 sellExchangeName: $sellEx,
                                 sellOrderBook: $orderBooks[$sellEx],
-                                targetAmountUsd: 100.0, // Configure position size
-                                minNetMarginPct: 0.0035  // 0.35% minimum profit
+                                targetAmountUsd: $targetAmountUsd, // --size, default $100
+                                // Despite the name, the evaluator wants a fraction rather
+                                // than a percentage — 0.0035 for 0.35%.
+                                minNetMarginPct: $minNetMarginPct / 100.0
                             );
 
                             if ($opportunity) {
@@ -137,6 +208,89 @@ class ArbitrageDetectionScannerCommand extends Command
         }
 
         return Command::SUCCESS;
+    }
+
+    /**
+     * Reads --size, or null when it does not describe a position anyone meant to take.
+     *
+     * Rejected rather than coerced. A bare (float) cast turns "1o0" into 0.0 and a stray
+     * "100 USD" into 100.0 — one of those silently disables trading and the other silently
+     * trades. Neither is a reading of the operator's intent worth guessing at when real
+     * money is on the other end of it.
+     */
+    private function resolveTargetAmount(InputInterface $input, OutputInterface $output): ?float
+    {
+        $raw = $input->getOption('size');
+
+        if (!is_numeric($raw)) {
+            $output->writeln(sprintf(
+                '<error>--size must be an amount in USD, got "%s".</error>',
+                is_scalar($raw) ? (string) $raw : get_debug_type($raw)
+            ));
+
+            return null;
+        }
+
+        $size = (float) $raw;
+
+        if ($size <= 0.0) {
+            // The evaluator would throw on this anyway; catching it here means the message
+            // says which option was wrong instead of surfacing as a scanner exception.
+            $output->writeln(sprintf('<error>--size must be greater than zero, got %s.</error>', $size));
+
+            return null;
+        }
+
+        return $size;
+    }
+
+    /**
+     * Reads --min-margin as a percentage, or null when it is not one.
+     *
+     * Zero is allowed and means "take anything that clears its fees". What is not allowed
+     * is the value that looks like zero without saying so: this option is a percentage, so
+     * a fraction typed into it — 0.0035 meant as 0.35% — sets the bar six thousand times
+     * lower than intended and turns the scanner loose on spreads that cannot pay for
+     * themselves. That is the one mistake here that costs money rather than opportunities,
+     * so it is named rather than accepted.
+     */
+    private function resolveMinNetMargin(InputInterface $input, OutputInterface $output): ?float
+    {
+        $raw = $input->getOption('min-margin');
+
+        if (!is_numeric($raw)) {
+            $output->writeln(sprintf(
+                '<error>--min-margin must be a percentage, got "%s".</error>',
+                is_scalar($raw) ? (string) $raw : get_debug_type($raw)
+            ));
+
+            return null;
+        }
+
+        $margin = (float) $raw;
+
+        if ($margin < 0.0) {
+            $output->writeln(sprintf(
+                '<error>--min-margin cannot be negative, got %s. Use 0 to take every spread that clears its fees.</error>',
+                $margin
+            ));
+
+            return null;
+        }
+
+        if ($margin > 0.0 && $margin < self::IMPLAUSIBLY_SMALL_MARGIN_PCT) {
+            $output->writeln(sprintf(
+                '<error>--min-margin is a percentage, so %s means %s%% — effectively no threshold at all. '
+                . 'Did you mean %s? Use 0 to take every spread that clears its fees.</error>',
+                $margin,
+                $margin,
+                $margin * 100
+            ));
+
+            return null;
+        }
+
+        return $margin;
     }
 
     /**
