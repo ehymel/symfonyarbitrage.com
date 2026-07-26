@@ -15,7 +15,10 @@ framework:
             async_trading:
                 dsn: '%env(MESSENGER_TRANSPORT_DSN)%' # e.g., redis://localhost:6379/messages or doctrine://default
                 options:
-                    queue_name: high_priority_trades
+                    stream: 'high_priority_trades' # Correct key for Redis DSN
+                    group: 'trading_workers'
+                    consumer: 'worker_1'
+#                    queue_name: high_priority_trades # queue_name used for doctrine transport
 
         default_bus: messenger.bus.default
 
