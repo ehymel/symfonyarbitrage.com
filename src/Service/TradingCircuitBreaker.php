@@ -9,8 +9,6 @@ use Symfony\Component\Notifier\Message\SmsMessage;
 use Symfony\Component\Notifier\TexterInterface;
 use Symfony\Contracts\Cache\CacheInterface;
 use Psr\Log\LoggerInterface;
-use Symfony\Component\Notifier\NotifierInterface;
-use Symfony\Component\Notifier\Notification\Notification;
 
 class TradingCircuitBreaker
 {
@@ -22,10 +20,10 @@ class TradingCircuitBreaker
         private CacheInterface $cache,
         private TexterInterface $texter,
         private LoggerInterface $logger,
+        #[Autowire(env: 'ADMIN_PHONE_NUMBER')] private string $adminPhoneNumber,
         private int $maxFailures = 2,
         private int $maxLatencyMs = 450,
         private int $cooldownSeconds = 300, // 5-minute pause
-        #[Autowire(env: 'ADMIN_PHONE_NUMBER')] private string $adminPhoneNumber,
     ) {}
 
     /**
@@ -85,7 +83,7 @@ class TradingCircuitBreaker
 
     /**
      * Record execution errors or severe API failures.
-     * @throws InvalidArgumentException
+     * @throws InvalidArgumentException|TransportExceptionInterface
      */
     public function recordFailure(string $exchange, string $reason): void
     {
