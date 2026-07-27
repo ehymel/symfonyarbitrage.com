@@ -135,6 +135,16 @@ a pager nobody reads.
   them.
 - **`cache.app` is shared** between the circuit breaker's state machine and the funding guard's
   alert throttle. Clearing it resets both.
+- **ccxt's `timeout` option is a trap.** It is documented in milliseconds and passed straight
+  into `React\Socket\Connector`, which reads it as seconds; ccxt never sets a request timeout
+  on the `Browser` at all. `AbstractCcxtExchangeService` therefore builds its own connector and
+  wraps each call in `React\Promise\Timer\timeout()`. Do not "simplify" that back to ccxt's own
+  setting. The budgets are asymmetric on purpose — see the constructor.
+- **ReactPHP does its own DNS**, bypassing `getaddrinfo` and so RFC 6724 source-address
+  selection. On a host with no IPv6, Happy Eyeballs still resolves and dials the AAAA records
+  Cloudflare publishes for `api.coinbase.com`, failing with `EADDRNOTAVAIL` on every request —
+  suppressed by React, logged at debug by Symfony, and drowning `var/log/dev.log`. The
+  connector is built with `happy_eyeballs => false` for that reason.
 - **`.env` declares every variable; `.env.local` holds the real values** and is gitignored.
   Adding an `#[Autowire(env: ...)]` means adding the key to `.env` or the container will not
   compile.
