@@ -348,11 +348,11 @@ class ArbitrageDetectionScannerCommand extends Command
      */
     private function handleOpportunityDetected($dto, OutputInterface $output): void
     {
-        $output->writeln("⚡ ARBITRAGE DETECTED! " . $dto->pair . " | Buy " . $dto->buyExchange . " @ $" . $dto->buyPrice . " | Sell " . $dto->sellExchange . " @ $" . $dto->sellPrice . " | Est. Profit: $" . $dto->netProfitUsd);
-        $this->logger->info(sprintf(
-            "⚡ ARBITRAGE DETECTED! %s | Buy %s @ $%.2f | Sell %s @ $%.2f | Est. Profit: $%.4f",
-            $dto->pair, $dto->buyExchange, $dto->buyPrice, $dto->sellExchange, $dto->sellPrice, $dto->netProfitUsd
-        ));
+        $msg = sprintf("⚡ ARBITRAGE DETECTED! %s | Buy %s @ $%.2f | Sell %s @ $%.2f | Est. Profit: $%.4f",
+            $dto->pair, $dto->buyExchange, $dto->buyPrice, $dto->sellExchange, $dto->sellPrice, $dto->netProfitUsd);
+
+        $output->writeln($msg);
+        $this->logger->info($msg);
 
         // 1. Record to RDS
         $opp = new ArbitrageOpportunity();
