@@ -2,12 +2,12 @@
 
 namespace App\Service;
 
+use Psr\Cache\CacheItemPoolInterface;
 use Psr\Cache\InvalidArgumentException;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use Symfony\Component\Notifier\Exception\TransportExceptionInterface;
 use Symfony\Component\Notifier\Message\SmsMessage;
 use Symfony\Component\Notifier\TexterInterface;
-use Symfony\Contracts\Cache\CacheInterface;
 use Psr\Log\LoggerInterface;
 
 class TradingCircuitBreaker
@@ -16,8 +16,16 @@ class TradingCircuitBreaker
     private const string STATE_OPEN = 'OPEN';
     private const string STATE_HALF_OPEN = 'HALF_OPEN';
 
+    /**
+     * A PSR-6 item pool rather than the contracts' CacheInterface, because the latter has
+     * no way to read without writing: get() persists whatever its callback returns, so
+     * every pre-trade check on an untripped venue was creating a cache entry. The scanner
+     * only ever reads this state, and it checks two venues per pair several times a
+     * second — enough that a pool it lacked write permission on buried the log, and
+     * enough contention to be worth avoiding even where the writes succeed.
+     */
     public function __construct(
-        private readonly CacheInterface  $cache,
+        private readonly CacheItemPoolInterface $cache,
         private readonly TexterInterface $texter,
         private readonly LoggerInterface $logger,
         #[Autowire(env: 'ADMIN_PHONE_NUMBER')]
@@ -29,12 +37,15 @@ class TradingCircuitBreaker
 
     /**
      * Pre-trade check: Call this BEFORE placing any order.
+     *
+     * The common case — a venue nobody has tripped — reads one key and writes nothing.
+     * An absent state entry *is* CLOSED, so there is no default worth persisting.
+     *
      * @throws InvalidArgumentException
      */
     public function isAllowed(string $exchange): bool
     {
-        $stateKey = sprintf('cb_%s_state', $exchange);
-        $state = $this->cache->get($stateKey, fn() => self::STATE_CLOSED);
+        $state = $this->read(sprintf('cb_%s_state', $exchange)) ?? self::STATE_CLOSED;
 
         if ($state === self::STATE_CLOSED) {
             return true;
@@ -42,7 +53,17 @@ class TradingCircuitBreaker
 
         if ($state === self::STATE_OPEN) {
             $openedAtKey = sprintf('cb_%s_opened_at', $exchange);
-            $openedAt = $this->cache->get($openedAtKey, fn() => time());
+            $openedAt = $this->read($openedAtKey);
+
+            if ($openedAt === null) {
+                // An open circuit whose marker has gone missing cannot be dated, and an
+                // undateable block is no evidence the venue recovered — so the clock
+                // restarts here rather than being assumed to have run out. Writing it
+                // down is what makes that terminate: left in memory, every subsequent
+                // call would restart the cooldown too and the venue would stay dark.
+                $openedAt = time();
+                $this->write($openedAtKey, $openedAt);
+            }
 
             // Check if cooldown period has elapsed
             if ((time() - $openedAt) > $this->cooldownSeconds) {
@@ -69,8 +90,7 @@ class TradingCircuitBreaker
             return;
         }
 
-        $stateKey = sprintf('cb_%s_state', $exchange);
-        $currentState = $this->cache->get($stateKey, fn() => self::STATE_CLOSED);
+        $currentState = $this->read(sprintf('cb_%s_state', $exchange)) ?? self::STATE_CLOSED;
 
         if ($currentState === self::STATE_HALF_OPEN) {
             // Probe trade succeeded! Reset back to normal
@@ -78,7 +98,7 @@ class TradingCircuitBreaker
             $this->notify(sprintf("🟢 Circuit Breaker CLOSED for %s. Trading resumed.", $exchange));
         } else {
             // Reset failure counter on clean trade
-            $this->cache->delete(sprintf('cb_%s_failures', $exchange));
+            $this->cache->deleteItem(sprintf('cb_%s_failures', $exchange));
         }
     }
 
@@ -89,11 +109,8 @@ class TradingCircuitBreaker
     public function recordFailure(string $exchange, string $reason): void
     {
         $failKey = sprintf('cb_%s_failures', $exchange);
-        $failures = $this->cache->get($failKey, fn() => 0) + 1;
-
-        // Save updated failure count
-        $this->cache->delete($failKey);
-        $this->cache->get($failKey, fn() => $failures);
+        $failures = ($this->read($failKey) ?? 0) + 1;
+        $this->write($failKey, $failures);
 
         $this->logger->warning(sprintf("Circuit breaker warning for %s: %s (Count: %d)", $exchange, $reason, $failures));
 
@@ -117,9 +134,7 @@ class TradingCircuitBreaker
         // Without this, a failed probe after the cooldown would find a count of 1, fall
         // short of maxFailures, and leave the venue HALF_OPEN — quietly readmitting
         // trades to somewhere that has already proven it cannot be trusted.
-        $failKey = sprintf('cb_%s_failures', $exchange);
-        $this->cache->delete($failKey);
-        $this->cache->get($failKey, fn() => $this->maxFailures);
+        $this->write(sprintf('cb_%s_failures', $exchange), $this->maxFailures);
 
         $this->trip($exchange, $reason);
     }
@@ -130,10 +145,7 @@ class TradingCircuitBreaker
     private function trip(string $exchange, string $reason): void
     {
         $this->transitionTo($exchange, self::STATE_OPEN);
-
-        $openedAtKey = sprintf('cb_%s_opened_at', $exchange);
-        $this->cache->delete($openedAtKey);
-        $this->cache->get($openedAtKey, fn() => time());
+        $this->write(sprintf('cb_%s_opened_at', $exchange), time());
 
         $msg = sprintf("🚨 CIRCUIT BREAKER TRIPPED on %s! Reason: %s. Trading paused for %ds.", $exchange, $reason, $this->cooldownSeconds);
         $this->logger->critical($msg);
@@ -146,8 +158,10 @@ class TradingCircuitBreaker
     private function reset(string $exchange): void
     {
         $this->transitionTo($exchange, self::STATE_CLOSED);
-        $this->cache->delete(sprintf('cb_%s_failures', $exchange));
-        $this->cache->delete(sprintf('cb_%s_opened_at', $exchange));
+        $this->cache->deleteItems([
+            sprintf('cb_%s_failures', $exchange),
+            sprintf('cb_%s_opened_at', $exchange),
+        ]);
     }
 
     /**
@@ -155,9 +169,37 @@ class TradingCircuitBreaker
      */
     private function transitionTo(string $exchange, string $state): void
     {
-        $stateKey = sprintf('cb_%s_state', $exchange);
-        $this->cache->delete($stateKey);
-        $this->cache->get($stateKey, fn() => $state);
+        $this->write(sprintf('cb_%s_state', $exchange), $state);
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    private function read(string $key): mixed
+    {
+        $item = $this->cache->getItem($key);
+
+        return $item->isHit() ? $item->get() : null;
+    }
+
+    /**
+     * A rejected save is reported rather than ignored. PSR-6 pools answer with false
+     * instead of throwing, so a backend the process cannot write to — the wrong owner on
+     * a filesystem pool, an unreachable Redis — would otherwise let trip() page the admin
+     * and log its critical while the venue quietly stayed tradeable for whoever checked
+     * next. Deliberately does not throw: the handler's guardBreaker() already treats a
+     * degraded breaker as survivable, and the ledger row matters more than this write.
+     *
+     * @throws InvalidArgumentException
+     */
+    private function write(string $key, mixed $value): void
+    {
+        if (!$this->cache->save($this->cache->getItem($key)->set($value))) {
+            $this->logger->critical(sprintf(
+                'Circuit breaker state "%s" could not be persisted; the breaker is degraded and its decisions will not be seen by other processes.',
+                $key
+            ));
+        }
     }
 
     /**

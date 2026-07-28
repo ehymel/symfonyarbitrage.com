@@ -3,16 +3,23 @@ framework:
         # Unique name of your app: used to compute stable namespaces for cache keys.
         #prefix_seed: your_vendor_name/app_name
 
-        # The "app" cache stores to the filesystem by default.
-        # The data in this cache should persist between deploys.
-        # Other options include:
+        # Redis rather than the filesystem default, because this pool is not a cache in
+        # the disposable sense: it holds the circuit breaker's state machine and the
+        # funding guard's alert throttle, and the scanner and the messenger worker are
+        # separate processes that have to agree on both. On the filesystem that agreement
+        # rested on two OS users being able to write each other's files, which is how a
+        # scanner running under the wrong uid came to be unable to record a trip at all.
+        # Redis is already running for the async_trading transport, so this is a backend
+        # both processes reach identically and no new infrastructure.
+        #
+        # REDIS_DSN deliberately points at a different database index from
+        # MESSENGER_TRANSPORT_DSN: flushing the cache must not be able to discard queued
+        # trades.
+        app: cache.adapter.redis
+        default_redis_provider: '%env(REDIS_DSN)%'
 
-        # Redis
-        #app: cache.adapter.redis
-        #default_redis_provider: redis://localhost
-
-        # APCu (not recommended with heavy random-write workloads as memory fragmentation can cause perf issues)
-        #app: cache.adapter.apcu
+        # APCu is not an option here — it is per-process memory, so the two halves of the
+        # pipeline would each keep their own private idea of which venues are tripped.
 
         # Namespaced pools use the above "app" backend by default
         #pools:

@@ -6,6 +6,8 @@ namespace App\Tests\Service;
 use App\Service\TradingCircuitBreaker;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
+use Psr\Cache\CacheItemInterface;
+use Psr\Cache\CacheItemPoolInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\LogLevel;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
@@ -51,6 +53,33 @@ final class TradingCircuitBreakerTest extends TestCase
     public function testFreshCircuitAllowsTrading(): void
     {
         self::assertTrue($this->breaker()->isAllowed(self::EXCHANGE));
+    }
+
+    /**
+     * The scanner checks two venues per pair several times a second and never records an
+     * outcome, so a pre-trade check that persisted its own default turned a pure reader
+     * into a writer: on a filesystem pool owned by the worker's user, every one of those
+     * checks failed to save and logged a warning. Nothing about an untripped venue is
+     * worth writing down — an absent entry already means CLOSED.
+     */
+    public function testCheckingAnUntrippedCircuitWritesNothing(): void
+    {
+        $breaker = $this->breaker();
+
+        $breaker->isAllowed(self::EXCHANGE);
+        $breaker->isAllowed(self::EXCHANGE);
+
+        self::assertSame([], $this->storedKeys());
+    }
+
+    public function testCheckingATrippedCircuitDoesNotRewriteItsState(): void
+    {
+        $breaker = $this->trippedBreaker();
+        $before = $this->cache->getValues();
+
+        self::assertFalse($breaker->isAllowed(self::EXCHANGE));
+
+        self::assertSame($before, $this->cache->getValues());
     }
 
     public function testFailureBelowThresholdLeavesCircuitClosed(): void
@@ -240,6 +269,27 @@ final class TradingCircuitBreakerTest extends TestCase
         self::assertSame('HALF_OPEN', $this->state(self::EXCHANGE));
     }
 
+    /**
+     * An open circuit that has lost its opened_at marker cannot be dated. Treating that
+     * as "the cooldown must have elapsed" would readmit trades to a venue on the strength
+     * of a missing cache entry, so the clock restarts instead — and it is written down,
+     * because a restart held only in memory would repeat on every check and leave the
+     * venue permanently dark.
+     */
+    public function testAnOpenCircuitWithNoOpenedAtMarkerServesAFreshCooldown(): void
+    {
+        $breaker = $this->breaker();
+        $this->cache->save($this->cache->getItem(sprintf('cb_%s_state', self::EXCHANGE))->set('OPEN'));
+
+        self::assertFalse($breaker->isAllowed(self::EXCHANGE), 'an undateable block is not a recovered venue');
+
+        $openedAt = $this->cached(sprintf('cb_%s_opened_at', self::EXCHANGE));
+        self::assertIsInt($openedAt, 'the restarted clock must be persisted, or it restarts again on the next check');
+
+        $this->backdateOpenedAt(self::EXCHANGE, self::COOLDOWN_SECONDS + 1);
+        self::assertTrue($breaker->isAllowed(self::EXCHANGE), 'and it must then expire like any other cooldown');
+    }
+
     // --------------------------------------------------------------- RECOVERY
 
     public function testSuccessfulProbeClosesTheCircuitAndAnnouncesRecovery(): void
@@ -427,15 +477,48 @@ final class TradingCircuitBreakerTest extends TestCase
         self::assertSame([], $this->logMessages(LogLevel::CRITICAL));
     }
 
+    // ------------------------------------------------------- DEGRADED STORAGE
+
+    /**
+     * PSR-6 pools answer a rejected save with false rather than an exception, so a
+     * backend the process cannot write to fails silently by default. That is the shape of
+     * the worst version of this bug: the admin is paged, the critical is logged, and the
+     * venue stays tradeable for the next process to check it. The breaker cannot fix an
+     * unwritable pool, but it must not let one pass for a working one.
+     */
+    public function testATripThatCannotBePersistedIsReportedAsCritical(): void
+    {
+        $breaker = $this->breaker(cache: $this->unwritablePool());
+
+        $breaker->tripImmediately(self::EXCHANGE, 'Unwind failed: venue is down');
+
+        $degraded = array_filter(
+            $this->logMessages(LogLevel::CRITICAL),
+            static fn(string $message): bool => str_contains($message, 'cb_binance_state" could not be persisted')
+        );
+
+        self::assertNotEmpty($degraded, 'a breaker whose state did not persist must say so');
+    }
+
+    public function testAWorkingPoolReportsNoDegradation(): void
+    {
+        $this->breaker()->tripImmediately(self::EXCHANGE, 'Unwind failed: venue is down');
+
+        foreach ($this->logMessages(LogLevel::CRITICAL) as $message) {
+            self::assertStringNotContainsString('could not be persisted', $message);
+        }
+    }
+
     // ----------------------------------------------------------------- HELPERS
 
     private function breaker(
         int $maxFailures = self::MAX_FAILURES,
         int $maxLatencyMs = self::MAX_LATENCY_MS,
         int $cooldownSeconds = self::COOLDOWN_SECONDS,
+        ?CacheItemPoolInterface $cache = null,
     ): TradingCircuitBreaker {
         return new TradingCircuitBreaker(
-            $this->cache,
+            $cache ?? $this->cache,
             $this->recordingTexter(),
             $this->logger,
             self::ADMIN_PHONE,
@@ -475,6 +558,28 @@ final class TradingCircuitBreakerTest extends TestCase
         return $breaker;
     }
 
+    /**
+     * A pool that reads normally and rejects every write, the way a filesystem pool
+     * behaves for a process that lacks permission on the pool directory.
+     */
+    private function unwritablePool(): CacheItemPoolInterface
+    {
+        return new class ($this->cache) implements CacheItemPoolInterface {
+            public function __construct(private readonly CacheItemPoolInterface $inner) {}
+
+            public function save(CacheItemInterface $item): bool { return false; }
+            public function saveDeferred(CacheItemInterface $item): bool { return false; }
+            public function commit(): bool { return false; }
+
+            public function getItem(string $key): CacheItemInterface { return $this->inner->getItem($key); }
+            public function getItems(array $keys = []): iterable { return $this->inner->getItems($keys); }
+            public function hasItem(string $key): bool { return $this->inner->hasItem($key); }
+            public function clear(): bool { return $this->inner->clear(); }
+            public function deleteItem(string $key): bool { return $this->inner->deleteItem($key); }
+            public function deleteItems(array $keys): bool { return $this->inner->deleteItems($keys); }
+        };
+    }
+
     private function recordingTexter(): TexterInterface
     {
         $texter = $this->createStub(TexterInterface::class);
@@ -502,9 +607,28 @@ final class TradingCircuitBreakerTest extends TestCase
         $this->cache->get($key, fn() => time() - $secondsAgo);
     }
 
-    private function state(string $exchange): ?string
+    /**
+     * An absent state entry is CLOSED — that is what lets a pre-trade check on an
+     * untripped venue avoid writing anything at all.
+     */
+    private function state(string $exchange): string
     {
-        return $this->cached(sprintf('cb_%s_state', $exchange));
+        return $this->cached(sprintf('cb_%s_state', $exchange)) ?? 'CLOSED';
+    }
+
+    /**
+     * The keys the pool actually holds. ArrayAdapter tracks misses by parking a null in
+     * its value map, so merely reading a key leaves a footprint there; the expiry set
+     * behind hasItem() is what separates a stored entry from a probed one.
+     *
+     * @return list<string>
+     */
+    private function storedKeys(): array
+    {
+        return array_values(array_filter(
+            array_keys($this->cache->getValues()),
+            fn(string $key): bool => $this->cache->hasItem($key)
+        ));
     }
 
     /**

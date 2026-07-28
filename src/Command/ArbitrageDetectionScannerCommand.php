@@ -54,15 +54,6 @@ class ArbitrageDetectionScannerCommand extends Command
      */
     private const float IMPLAUSIBLY_SMALL_MARGIN_PCT = 0.01;
 
-//    private array $exchangesToScan = ['coinbase', 'kraken', 'binance'];
-    private array $exchangesToScan = [
-        'coinbase',
-        'kraken',
-        'cryptocom',
-//        'gemini',   // awaiting api key
-//        'binance',  // not available in Texas
-//        'bitstamp',  // not available in Texas
-    ];
     private array $tradingPairs = ['ETH/USDT', 'BTC/USDT', 'SOL/USDT', 'AVAX/USDT', 'DOGE/USDT'];
 
     /** Set once a run has already paged about unrecordable opportunities. */
@@ -78,7 +69,28 @@ class ArbitrageDetectionScannerCommand extends Command
         private readonly EntityManagerInterface $em,
         private readonly LoggerInterface        $logger,
         private readonly AdminAlerter           $adminAlerter,
-        /** Pause after a write failure that left the connection usable. */
+        /**
+         * The venues to cross-compare — the list that decides where this process can place
+         * real orders, so it is stated here rather than assembled from whatever happens to
+         * be wired into the container: a venue starts trading because someone added it to
+         * this line, not because a credential appeared.
+         *
+         * Defaulted, so production wiring stays a no-op, but injectable so a caller can
+         * declare its own set. A hardcoded property could not be narrowed, which meant a
+         * test had to keep a service locator in lockstep with this list or fail on a name
+         * it had no double for.
+         *
+         * @var list<string>
+         */
+        private readonly array                  $exchangesToScan = [
+            'coinbase',
+            'kraken',
+            'cryptocom',
+//            'gemini',   // awaiting api key
+//            'binance',  // not available in Texas
+//            'bitstamp',  // not available in Texas
+        ],
+        /** Pause after a write-failure that left the connection usable. */
         private readonly int                    $writeFailureBackoffSeconds = 5,
     ) {
         parent::__construct();
