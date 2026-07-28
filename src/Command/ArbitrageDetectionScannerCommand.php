@@ -55,8 +55,15 @@ class ArbitrageDetectionScannerCommand extends Command
     private const float IMPLAUSIBLY_SMALL_MARGIN_PCT = 0.01;
 
 //    private array $exchangesToScan = ['coinbase', 'kraken', 'binance'];
-    private array $exchangesToScan = ['coinbase', 'kraken'];
-    private array $tradingPairs = ['ETH/USDT', 'BTC/USDT', 'SOL/USDT'];
+    private array $exchangesToScan = [
+        'coinbase',
+        'kraken',
+        'cryptocom',
+//        'gemini',   // awaiting api key
+//        'binance',  // not available in Texas
+//        'bitstamp',  // not available in Texas
+    ];
+    private array $tradingPairs = ['ETH/USDT', 'BTC/USDT', 'SOL/USDT', 'AVAX/USDT', 'DOGE/USDT'];
 
     /** Set once a run has already paged about unrecordable opportunities. */
     private bool $writeFailureAlerted = false;
