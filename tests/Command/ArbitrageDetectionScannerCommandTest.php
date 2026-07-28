@@ -45,7 +45,14 @@ use Symfony\Component\Notifier\Recipient\RecipientInterface;
 #[CoversClass(ArbitrageDetectionScannerCommand::class)]
 final class ArbitrageDetectionScannerCommandTest extends TestCase
 {
-    /** Mirrors the command's own hard-coded configuration. */
+    /**
+     * What these tests tell the command to scan — not a mirror of its production default.
+     * Both are injected, and the locator is built from the same list, so the fixture can
+     * no longer drift out of step with the venue list the way it did when crypto.com was
+     * added and every test in this class died on a name it had no double for.
+     *
+     * @var list<string>
+     */
     private const array VENUES = ['coinbase', 'kraken'];
     private const array PAIRS = ['ETH/USDT', 'BTC/USDT', 'SOL/USDT'];
 
@@ -177,6 +184,42 @@ final class ArbitrageDetectionScannerCommandTest extends TestCase
     public function testTheCommandReportsSuccessWhenItsCycleBudgetIsSpent(): void
     {
         self::assertSame(0, $this->execute()->getStatusCode());
+    }
+
+    /**
+     * A venue named in the scan list but never wired into the container is a deployment
+     * mistake, and it stops the run at startup rather than throwing from inside the loop's
+     * catch-all four times a second with the process still reporting itself as working.
+     * Same reasoning as the --size and --min-margin guards.
+     */
+    public function testAVenueWithNoServiceStopsTheRunBeforeAnythingIsScanned(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unsupported exchange: bitstamp');
+
+        $this->execute(venues: ['coinbase', 'bitstamp'], wiredVenues: ['coinbase']);
+    }
+
+    public function testNothingIsWarmedOrReadWhenAVenueIsMissing(): void
+    {
+        try {
+            $this->execute(venues: ['coinbase', 'bitstamp'], wiredVenues: ['coinbase']);
+        } catch (\InvalidArgumentException) {
+            // The assertion is what did *not* happen before the throw.
+        }
+
+        self::assertSame([], $this->trace, 'venues are resolved up front, so the run dies before it warms');
+    }
+
+    public function testOnlyTheVenuesItWasGivenAreScanned(): void
+    {
+        $this->execute(venues: ['coinbase']);
+
+        self::assertSame(['coinbase'], array_keys($this->venues));
+        self::assertSame(
+            ['coinbase'],
+            array_values(array_unique(array_column($this->reads, 'venue')))
+        );
     }
 
     // ------------------------------------------------------------------- CYCLES
@@ -728,16 +771,27 @@ final class ArbitrageDetectionScannerCommandTest extends TestCase
         ];
     }
 
+    /**
+     * @param list<string>  $venues      venues the command is told to scan
+     * @param list<string>|null $wiredVenues venues the locator can actually supply;
+     *                                   defaults to $venues, and is only worth setting
+     *                                   apart to model a venue that was never wired up
+     */
     private function execute(
         int $limit = 1,
         ?MessageBusInterface $bus = null,
         string|float|null $size = null,
         string|float|null $minMargin = null,
+        array $venues = self::VENUES,
+        ?array $wiredVenues = null,
     ): CommandTester {
-        $factory = new ExchangeFactory(new ServiceLocator([
-            'coinbase' => fn(): ExchangeServiceInterface => $this->venue('coinbase'),
-            'kraken' => fn(): ExchangeServiceInterface => $this->venue('kraken'),
-        ]));
+        $services = [];
+
+        foreach ($wiredVenues ?? $venues as $name) {
+            $services[$name] = fn(): ExchangeServiceInterface => $this->venue($name);
+        }
+
+        $factory = new ExchangeFactory(new ServiceLocator($services));
         $logger = $this->recordingLogger();
 
         $command = new ArbitrageDetectionScannerCommand(
@@ -750,6 +804,8 @@ final class ArbitrageDetectionScannerCommandTest extends TestCase
             $this->entityManager(),
             $logger,
             $this->recordingAlerter(),
+            exchangesToScan: $venues,
+            tradingPairs: self::PAIRS,
             writeFailureBackoffSeconds: 0,
         );
 

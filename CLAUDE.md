@@ -14,8 +14,9 @@ admin, and an authentication stack with passkeys, TOTP/email 2FA and Turnstile.
 
 ## Stack
 
-PHP 8.4+ (8.5 in dev) · Symfony 8.1 · Doctrine ORM 3 · PostgreSQL · Redis (Messenger transport)
-· ccxt 4.5 async client over ReactPHP · PHPUnit 13 · Windows dev environment.
+PHP 8.4+ (8.5 in dev) · Symfony 8.1 · Doctrine ORM 3 · PostgreSQL · Redis (Messenger transport
+on db 0, `cache.app` on db 1) · ccxt 4.5 async client over ReactPHP · PHPUnit 13 · Windows dev
+environment.
 
 ## Commands
 
@@ -48,16 +49,17 @@ ArbitrageDetectionScannerCommand      loops every 250ms
   └─ ExecuteArbitrageMessage  ──────► async_trading (Redis)
                                         │
 ExecuteArbitrageHandler ◄───────────────┘
-  1. TradingCircuitBreaker    both venues must be closed          (local)
-  2. MinimumOrderSizeGuard    both legs must clear the venue floor (local)
-  3. TradeFundingGuard        both venues must be able to settle their leg (network)
+  1. TradingCircuitBreaker    both venues must be closed          (localhost Redis)
+  2. MinimumOrderSizeGuard    both legs must clear the venue floor (in-process)
+  3. TradeFundingGuard        both venues must be able to settle their leg (venue API)
   4. both legs dispatched concurrently, then settled together
   5. partial fill → emergency unwind
   6. TradeExecution row written, whatever happened
 ```
 
-The gates run cheapest first: two local lookups before the balance round trip, so nothing
-spends a network call on a trade that was already disqualified.
+The gates run cheapest first: a localhost Redis read and an in-process lookup before the
+balance round trip, so nothing spends a venue API call on a trade that was already
+disqualified.
 
 `ExchangeServiceInterface` is the only thing that talks to a venue. Every method has an async
 twin (`getBalanceAsync`, `getOrderBookAsync`, `executeMarketOrderAsync`); the synchronous ones
@@ -70,9 +72,21 @@ instance per call would make the warm-up silently pointless.
 These are load-bearing. Each is enforced in code and pinned by a test; changing one is a
 deliberate risk decision, not a refactor.
 
-- **Nothing is committed before both gates pass.** Circuit breaker first (free, local), then
-  the funding check (network). Either one failing cancels the *whole* trade — a buy with no
-  exit is not an arbitrage, and neither is an exit with nothing to sell.
+- **Nothing is committed before both gates pass.** Circuit breaker first (cheap, localhost),
+  then the funding check (venue API). Either one failing cancels the *whole* trade — a buy with
+  no exit is not an arbitrage, and neither is an exit with nothing to sell.
+- **A breaker decision that did not persist is reported.** `TradingCircuitBreaker::write()`
+  checks what `save()` returned, because PSR-6 answers a rejected write with `false` rather
+  than an exception. Without it, a trip on an unreachable or unwritable pool would page the
+  admin, log its critical, and still leave the venue tradeable for the next process to check —
+  a breaker that looks healthy in the logs and stops nothing. It logs rather than throws:
+  `guardBreaker()` already treats a degraded breaker as survivable, and the ledger row
+  outranks the write.
+- **Checking a circuit never changes it.** `isAllowed()` is a pure read, which is why the
+  breaker holds a PSR-6 `CacheItemPoolInterface` and not the contracts' `CacheInterface` —
+  the latter's `get()` persists its callback's return, so a pre-trade check on an untripped
+  venue was a write. The scanner checks two venues per pair several times a second and records
+  no outcomes; it must not be a writer at all.
 - **Neither leg may be abandoned while its order is live.** The handler settles both legs
   rather than handing them to `all()`, which would return on the first rejection and leave a
   position nobody is tracking.
@@ -96,8 +110,9 @@ deliberate risk decision, not a refactor.
   warming is best effort, ccxt reloads lazily at order time, and blocking everything over a
   boot hiccup is the worse failure.
 - **Misconfigured risk controls refuse to start.** A negative safety margin, a non-positive
-  position size or an unreadable `--min-margin` stops the process while a human is still
-  looking at the terminal, rather than throwing four times a second from inside a loop.
+  position size, an unreadable `--min-margin`, or a venue in `exchangesToScan` with no service
+  behind it stops the process while a human is still looking at the terminal, rather than
+  throwing four times a second from inside a loop.
 
 ## Conventions
 
@@ -135,6 +150,22 @@ a pager nobody reads.
   them.
 - **`cache.app` is shared** between the circuit breaker's state machine and the funding guard's
   alert throttle. Clearing it resets both.
+- **It is Redis rather than the filesystem, and that is a correctness choice.** The scanner and
+  the worker are separate processes that must agree on which venues are tripped. On the
+  filesystem default that agreement rested on two OS users being able to write each other's
+  files in `var/share/<env>/pools/app`, and it silently did not hold: a scanner running under
+  the wrong uid could read the state but never record a trip. Do not "simplify" this back to
+  the default. `REDIS_DSN` points at db 1 while `MESSENGER_TRANSPORT_DSN` uses db 0, so
+  flushing the cache cannot discard queued trades.
+- **Breaker state has no TTL, so Redis' eviction policy is load-bearing.** `allkeys-lru` can
+  evict a tripped circuit and readmit trading to a venue that failed; `noeviction` or any
+  `volatile-*` policy leaves these keys alone. Restarting Redis also drops every circuit to
+  CLOSED, so restart it — and deploy changes to this pool — while nothing is tripped.
+- **The scanner's venue and trading-pair lists are constructor defaults**, not hardcoded
+  properties: `exchangesToScan` and `tradingPairs` on `ArbitrageDetectionScannerCommand`.
+  Production passes neither. Tests declare their own and build their `ServiceLocator` from the
+  same list, which is what stops a fixture drifting out of step with the venue list — adding
+  crypto.com to a hardcoded array previously failed all 38 tests in that class at once.
 - **ccxt's `timeout` option is a trap.** It is documented in milliseconds and passed straight
   into `React\Socket\Connector`, which reads it as seconds; ccxt never sets a request timeout
   on the `Browser` at all. `AbstractCcxtExchangeService` therefore builds its own connector and

@@ -54,8 +54,6 @@ class ArbitrageDetectionScannerCommand extends Command
      */
     private const float IMPLAUSIBLY_SMALL_MARGIN_PCT = 0.01;
 
-    private array $tradingPairs = ['ETH/USDT', 'BTC/USDT', 'SOL/USDT', 'AVAX/USDT', 'DOGE/USDT'];
-
     /** Set once a run has already paged about unrecordable opportunities. */
     private bool $writeFailureAlerted = false;
 
@@ -89,6 +87,21 @@ class ArbitrageDetectionScannerCommand extends Command
 //            'gemini',   // awaiting api key
 //            'binance',  // not available in Texas
 //            'bitstamp',  // not available in Texas
+        ],
+        /**
+         * Injectable for the same reason as the venue list: a cycle reads every pair from
+         * every venue, so this is the other half of what a scan costs per iteration, and a
+         * test that had to mirror it in a constant was a test that silently went wrong
+         * every time a pair was added here.
+         *
+         * @var list<string>
+         */
+        private readonly array                  $tradingPairs = [
+            'ETH/USDT',
+            'BTC/USDT',
+            'SOL/USDT',
+            'AVAX/USDT',
+            'DOGE/USDT',
         ],
         /** Pause after a write-failure that left the connection usable. */
         private readonly int                    $writeFailureBackoffSeconds = 5,
