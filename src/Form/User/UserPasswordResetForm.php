@@ -21,7 +21,6 @@ class UserPasswordResetForm extends AbstractType
                     'data-password-update-target' => 'currentPasswordInput',
                 ],
                 'row_attr' => ['class' => 'form-floating mb-4'],
-                'help' => 'Required to decrypt and safely transfer your private E2EE key envelope.',
             ])
             ->add('newPassword', PasswordType::class, [
                 'attr' => [

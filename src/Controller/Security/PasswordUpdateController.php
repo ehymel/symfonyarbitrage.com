@@ -29,10 +29,9 @@ class PasswordUpdateController extends AbstractController
         if ($form->isSubmitted() && $form->isValid()) {
             $formData = $form->getData();
             $newPassword = $formData['newPassword'] ?? null;
-            $newEncPrivateKeyPayload = $request->request->get('new_encrypted_private_key');
 
-            if (empty($newPassword) || empty($newEncPrivateKeyPayload)) {
-                $this->addFlash('danger', 'Cryptographic payload update was rejected. Form submission aborted.');
+            if (empty($newPassword)) {
+                $this->addFlash('danger', 'Missing new password');
                 return $this->redirectToRoute('app_profile_change_password');
             }
 
@@ -78,8 +77,6 @@ class PasswordUpdateController extends AbstractController
             }
 
             $newPassword = $request->request->get('new_password');
-            $newPublicKey = $request->request->get('new_public_key');
-            $newEncPrivateKeyPayload = $request->request->get('new_encrypted_private_key');
 
             if (empty($newPassword)) {
                 $this->addFlash('danger', 'New cryptographic credentials could not be verified. Please try again.');
